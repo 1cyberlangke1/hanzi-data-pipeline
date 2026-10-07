@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字海网 · 离线查看器</title>
+<style>
+  :root {
+    --bg: #f7f6f3;
+    --panel: #ffffff;
+    --ink: #23211e;
+    --muted: #7a756d;
+    --line: #e3ded6;
+    --accent: #8a5a2b;
+    --accent-soft: #f0e7dc;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    padding: 18px 24px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: .02em; }
+  .disclaimer {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .disclaimer b { color: var(--accent); font-weight: 600; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(320px, 420px) 1fr;
+    gap: 20px;
+    padding: 20px 24px 40px;
+    align-items: start;
+  }
+  .pane {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  form { display: flex; gap: 8px; }
+  input[type=search] {
+    flex: 1;
+    padding: 10px 12px;
+    font-size: 15px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fdfcfa;
+    color: var(--ink);
+  }
+  input[type=search]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button {
+    padding: 10px 16px;
+    font-size: 15px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint, .meta { font-size: 12.5px; color: var(--muted); margin: 8px 0 0; }
+  ul#results { list-style: none; margin: 12px 0 0; padding: 0; max-height: 62vh; overflow-y: auto; }
+  ul#results li {
+    padding: 9px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+  }
+  ul#results li:hover { background: var(--accent-soft); }
+  ul#results li.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+  .li-zi { font-size: 22px; font-family: "SimSun", "Songti SC", serif; min-width: 28px; text-align: center; }
+  .li-body { min-width: 0; }
+  .li-head { font-size: 13px; color: var(--muted); }
+  .li-text { font-size: 13px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 13px; }
+  .pager button { padding: 6px 12px; font-size: 13px; }
+
+  #detail .glyph {
+    font-family: "SimSun", "Songti SC", serif;
+    font-size: 96px;
+    line-height: 1.1;
+    text-align: center;
+    padding: 12px 0 4px;
+  }
+  #detail .glyph img { width: 110px; height: 110px; image-rendering: crisp-edges; }
+  #detail .ziid { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  table.props { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.props th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--muted);
+    width: 92px;
+    padding: 5px 8px 5px 0;
+    vertical-align: top;
+    white-space: nowrap;
+  }
+  table.props td { padding: 5px 0; }
+  h3.section {
+    font-size: 14px;
+    margin: 20px 0 8px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid var(--line);
+    color: var(--accent);
+  }
+  .meaning { font-size: 14.5px; white-space: pre-wrap; word-break: break-word; margin-bottom: 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    font-size: 20px;
+    font-family: "SimSun", "Songti SC", serif;
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    cursor: pointer;
+    background: #fdfcfa;
+  }
+  .chip:hover { background: var(--accent-soft); }
+  .chip small { font-family: inherit; font-size: 11px; color: var(--muted); }
+  .ids { font-size: 22px; font-family: "SimSun", serif; }
+  .nav { display: flex; justify-content: space-between; margin-top: 18px; }
+  .nav button { background: #fdfcfa; color: var(--ink); border: 1px solid var(--line); }
+  .error { color: #a33; font-size: 14px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>字海网 · 离线查看器</h1>
+  <p class="disclaimer">
+    <b>仅供学习交流使用</b> · 数据版权归原站（字海 zisea.com / 叶典 yedict.com）所有 ·
+    本工具只读取本机爬取数据，不提供任何数据分发
+  </p>
+</header>
+
+<main>
+  <section class="pane">
+    <form id="search-form">
+      <input id="q" type="search" placeholder="汉字 / ZIID（如 U04E00）/ 拼音 / 部首 / 释义关键词" autocomplete="off">
+      <button type="submit">搜索</button>
+    </form>
+    <p class="meta" id="meta">加载中…</p>
+    <ul id="results"></ul>
+    <div class="pager" id="pager" hidden>
+      <button id="prev" type="button">上一页</button>
+      <span id="page-info"></span>
+      <button id="next" type="button">下一页</button>
+    </div>
+  </section>
+
+  <section class="pane" id="detail">
+    <p class="hint">搜索后点击左侧结果查看单字详情。</p>
+  </section>
+</main>
+
+<script>
+const PAGE_SIZE = 60;
+const MEANING_KEYS = [
+  ['mean_h', '汉语大字典 / 基本释义'],
+  ['mean_z', '中华字海'],
+  ['mean_b', '八辅'],
+  ['mean_v', '异体字注'],
+  ['mean_k', '康熙字典'],
+  ['mean_j', '集韵 / 韵书'],
+  ['mean_g', '古文字'],
+  ['discuss', '讨论 / 备注'],
+];
+const STRUCTURES = { 0: '独体', 1: '两分（上下/左右）', 2: '三分', 3: '多分' };
+
+let state = { query: '', page: 0, total: 0, items: [] };
+
+const $ = (id) => document.getElementById(id);
+
+function esc(text) {
+  return String(text ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/* 释义里的 <br> 还原成换行，其余标签一律转义，避免把远端内容当 HTML 执行 */
+function renderMeaning(text) {
+  return esc(text).replace(/&lt;br\s*\/?&gt;/g, '\n').trim();
+}
+
+async function loadMeta() {
+  try {
+    const meta = await (await fetch('/api/meta')).json();
+    $('meta').textContent = `本机已收录 ${meta.count.toLocaleString()} 个字（数据 ${(meta.bytes / 1048576).toFixed(0)} MB）`;
+  } catch (err) {
+    $('meta').textContent = '无法读取索引，请确认爬虫已产出 chars.jsonl';
+  }
+}
+
+async function doSearch(page = 0) {
+  const q = $('q').value.trim();
+  if (!q) return;
+  state.query = q;
+  state.page = page;
+  const url = `/api/search?q=${encodeURIComponent(q)}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`;
+  const data = await (await fetch(url)).json();
+  state.items = data.items || [];
+  state.total = data.total || 0;
+  renderResults();
+}
+
+function renderResults() {
+  const list = $('results');
+  list.innerHTML = '';
+  if (!state.total) {
+    list.innerHTML = '<li class="hint">没有匹配结果。</li>';
+    $('pager').hidden = true;
+    return;
+  }
+  for (const item of state.items) {
+    const li = document.createElement('li');
+    li.dataset.ziid = item.ziid;
+    const glyph = item.zi
+      ? `<span class="li-zi">${esc(item.zi)}</span>`
+      : `<span class="li-zi"><img src="/api/sprite/${esc(item.ziid)}" alt="" width="24" height="24" onerror="this.replaceWith(document.createTextNode('□'))"></span>`;
+    li.innerHTML = `${glyph}<span class="li-body">
+        <span class="li-head">${esc(item.ziid)}${item.pinyin ? ' · ' + esc(item.pinyin) : ''}${item.radical ? ' · 部首 ' + esc(item.radical) : ''}</span>
+        <span class="li-text">${esc(item.text || '（无释义）')}</span>
+      </span>`;
+    li.addEventListener('click', () => showChar(item.ziid));
+    list.appendChild(li);
+  }
+  const pages = Math.ceil(state.total / PAGE_SIZE);
+  $('pager').hidden = pages <= 1;
+  $('page-info').textContent = `第 ${state.page + 1} / ${pages} 页 · 共 ${state.total} 条`;
+  $('prev').disabled = state.page === 0;
+  $('next').disabled = state.page >= pages - 1;
+}
+
+async function showChar(ziid) {
+  document.querySelectorAll('#results li').forEach((li) => li.classList.toggle('active', li.dataset.ziid === ziid));
+  const panel = $('detail');
+  panel.innerHTML = '<p class="hint">读取中…</p>';
+  let record;
+  try {
+    const response = await fetch(`/api/char/${encodeURIComponent(ziid)}`);
+    record = await response.json();
+    if (!response.ok) throw new Error(record.error || '读取失败');
+  } catch (err) {
+    panel.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    return;
+  }
+  panel.innerHTML = renderDetail(record);
+  panel.querySelectorAll('[data-goto]').forEach((el) => {
+    el.addEventListener('click', () => showChar(el.dataset.goto));
+  });
+}
+
+function renderDetail(record) {
+  const p = record.property || {};
+  const meanings = record.meanings || {};
+  const zi = p.zi || '';
+  const glyph = zi
+    ? `<div class="glyph">${esc(zi)}</div>`
+    : `<div class="glyph"><img src="/api/sprite/${esc(record.ziid)}" alt="${esc(record.ziid)}" onerror="this.parentNode.textContent='（本站无字形图）'"></div>`;
+
+  const rows = [
+    ['字海编号', record.ziid],
+    ['部首', p.radical],
+    ['总笔画', p.stroke_total],
+    ['部首外笔画', p.stroke_remaining],
+    ['结构', STRUCTURES[p.structure] ?? p.structure],
+    ['叶码', p.pinyin],
+    ['头 / 尾', [p.head, p.tail].filter(Boolean).join(' / ')],
+    ['头尾读音', [p.head_py_display, p.tail_py_display].filter(Boolean).join(' / ')],
+    ['标准字形', p.standard_form],
+    ['字形变体', p.font_variant],
+    ['中华字海', p.zh_ref ? `第 ${p.zh_ref.page} 页 第 ${p.zh_ref.number} 个` : ''],
+    ['汉语大字典', p.hd_ref ? `第 ${p.hd_ref.page} 页 第 ${p.hd_ref.number} 个` : ''],
+    ['来源', p.source_ref],
+    ['来源注', p.source_note],
+    ['跳转自', record.goto_from],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== '');
+
+  const propsTable = `<table class="props">${rows
+    .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`)
+    .join('')}</table>`;
+
+  const idsBlock = p.ids
+    ? `<h3 class="section">字形描述（IDS）</h3><p class="ids">${esc(p.ids)}</p>`
+    : '';
+
+  const meaningBlocks = MEANING_KEYS
+    .map(([key, label]) => {
+      const items = meanings[key] || [];
+      if (!items.length) return '';
+      const body = items.map((t) => `<div class="meaning">${renderMeaning(t)}</div>`).join('');
+      return `<h3 class="section">${esc(label)}</h3>${body}`;
+    })
+    .join('');
+
+  const variants = (record.variants || []).length
+    ? `<h3 class="section">异体 / 关联字</h3><div class="chips">${record.variants
+        .map((v) => `<span class="chip" data-goto="${esc(v.ziid)}">${esc(v.zi || '□')}<br><small>${esc(v.ziid)}</small></span>`)
+        .join('')}</div>`
+    : '';
+
+  const nav = `<div class="nav">
+      ${record.prev ? `<button type="button" data-goto="${esc(record.prev)}">← 上一字 ${esc(record.prev)}</button>` : '<span></span>'}
+      ${record.next ? `<button type="button" data-goto="${esc(record.next)}">下一字 ${esc(record.next)} →</button>` : '<span></span>'}
+    </div>`;
+
+  return `${glyph}<div class="ziid">${esc(record.ziid)}</div>${propsTable}${idsBlock}${meaningBlocks}${variants}${nav}`;
+}
+
+$('search-form').addEventListener('submit', (event) => { event.preventDefault(); doSearch(0); });
+$('prev').addEventListener('click', () => doSearch(Math.max(0, state.page - 1)));
+$('next').addEventListener('click', () => doSearch(state.page + 1));
+
+loadMeta();
+</script>
+</body>
+</html>

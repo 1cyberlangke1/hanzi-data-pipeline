@@ -1,0 +1,16 @@
+字海网离线工具集（zisea-offline）
+Copyright 2026 1cyberlangke1
+
+本仓库分两部分：
+  crawler/    字海网（新叶典）离线抓取与浏览工具
+  synthesis/  以抓取产出为底座的合成数据方案与管线
+
+一、本仓库不含任何来自字海网的数据
+    crawler/data/ 已在 .gitignore 中，任何情况下都不入库、不随仓库分发。
+    仓库里只有工具代码与方案文本本身。
+
+二、synthesis/ 的产出
+    合成方案只发布由程序与模型生成的派生数据，不发布原始抓取内容。使用者自行处置其产出。
+
+三、许可
+    本仓库代码按 Apache License 2.0 分发，全文见 LICENSE。

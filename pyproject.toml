@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hanzi-synth"
+version = "0.1.0"
+description = "汉字结构化数据的合成管线：L0 事实底座 → L2 题目构造 → L3 措辞 → L4 验证"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,4 @@
+# 本机 core.autocrlf=true：不钉 LF 的话 clone 出来变 CRLF，
+# sh 脚本/钩子直接失效，数据文件的行尾差异也会让「逐字节比较」失效。
+*.sh text eol=lf
+*.jsonl text eol=lf
