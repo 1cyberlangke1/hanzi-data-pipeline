@@ -10,12 +10,13 @@ from pathlib import Path
 
 from hanzi_synth.facts.loader import DataError
 from hanzi_synth.llm.provider import Completion
-from hanzi_synth.llm.verbalizer import batch_items_of, extract_json, payload_of
+from hanzi_synth.llm.verbalizer import Verbalized, batch_items_of, extract_json, payload_of
 from hanzi_synth.config import ConfigError, ProviderConfig
 from hanzi_synth.pipeline.run import (
     LOCAL_WORKER_CAP,
     PipelineBusy,
     PipelineConfig,
+    _verified_with_semantic_answer,
     is_local_endpoint,
     replay_rejects,
     run_pipeline,
@@ -24,6 +25,7 @@ from hanzi_synth.pipeline.run import (
 )
 from hanzi_synth.tasks.base import TaskSpec
 from hanzi_synth.tasks.registry import TASK_STEM_ASKS
+from hanzi_synth.verify.checks import verify
 
 
 class ScriptedClient:
@@ -325,8 +327,17 @@ class PipelineLiveTests(unittest.TestCase):
         first, second = client.requests
         self.assertEqual(len(second), len(first) + 1)  # 第二轮多一条反馈消息
         self.assertEqual(second[-1]["role"], "user")
-        # 坏正文的题干没写出主语 -> L4 一定报 subject_in_stem；这条原因必须出现在反馈里
-        self.assertIn("subject_in_stem", second[-1]["content"])
+        # 坏正文的题干没写出主语 -> L4 一定报 subject_in_stem；这条原因必须出现在反馈里。
+        # 回灌的是**英文**说法（中文失败原因会被 2B 整段抄进题干），但必须指名道姓：
+        # 反馈里要带着缺的那个串，模型才知道改哪里。
+        self.assertIn("required strings", second[-1]["content"])
+        self.assertIn("二", second[-1]["content"])
+        # 中文失败原因仍然进 rejects / attempt-stats，两条路各留各的
+        attempts = [
+            json.loads(line)
+            for line in out.with_suffix(".attempts.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(any("subject_in_stem" in item for item in attempts[0]["failures"]))
 
     def test_resume_does_not_silently_produce_nothing(self) -> None:
         """续跑时已被覆盖满的前缀字不占扫描预算：max_scan 只数真正构造过题的字。
@@ -807,6 +818,123 @@ class JudgeWiringTests(unittest.TestCase):
             )
 
 
+class BetterRoundTests(unittest.TestCase):
+    """输入：逐轮判定记录。输出：选中的那一轮。
+
+    预期：重试用尽时返回**最好的一轮**，不是最后一轮——实测第二轮退化（T10 整段输出散文、
+    T5_variant 把载荷原样回显）会把第一轮的合格产出顶掉，rejects 里记的也变成第二轮的原因。
+    """
+
+    def test_prefers_tier_a_over_tier_c(self) -> None:
+        from hanzi_synth.pipeline.run import _better_round
+
+        history = [
+            {"tier": "A", "failures": [], "judge": None, "roundtrip": None},
+            {"tier": "C", "failures": ["schema: 缺少 stem 槽位"], "judge": None, "roundtrip": None},
+        ]
+        self.assertEqual(_better_round(history, 1, 0), 0)
+
+    def test_prefers_the_round_without_a_roundtrip_veto(self) -> None:
+        from hanzi_synth.pipeline.run import _better_round
+
+        history = [
+            {"tier": "A", "failures": [], "judge": None, "roundtrip": {"ok": True, "error": ""}},
+            {"tier": "A", "failures": [], "judge": None, "roundtrip": {"ok": False, "error": ""}},
+        ]
+        self.assertEqual(_better_round(history, 1, 0), 0)
+
+    def test_absent_roundtrip_is_not_a_veto(self) -> None:
+        """往返检验缺席（error 非空）不算否决——与发布判据同一条规矩。"""
+        from hanzi_synth.pipeline.run import _better_round
+
+        history = [
+            {"tier": "A", "failures": [], "judge": None, "roundtrip": {"ok": False, "error": "boom"}},
+            {"tier": "A", "failures": ["x"], "judge": None, "roundtrip": None},
+        ]
+        self.assertEqual(_better_round(history, 1, 0), 0)
+
+    def test_fewer_failures_wins_and_ties_keep_the_earlier_round(self) -> None:
+        from hanzi_synth.pipeline.run import _better_round
+
+        history = [
+            {"tier": "C", "failures": ["a", "b"], "judge": None, "roundtrip": None},
+            {"tier": "C", "failures": ["a"], "judge": None, "roundtrip": None},
+        ]
+        self.assertEqual(_better_round(history, 0, 1), 1)
+        same = [dict(history[0]), dict(history[0])]
+        self.assertEqual(_better_round(same, 0, 1), 0)
+
+    def test_chosen_row_falls_back_to_the_last_row(self) -> None:
+        from hanzi_synth.pipeline.run import _chosen_row
+
+        self.assertEqual(_chosen_row([{"round": 1}, {"round": 2, "chosen": True}])["round"], 2)
+        self.assertEqual(_chosen_row([{"round": 1}])["round"], 1)
+        self.assertEqual(_chosen_row([]), {})
+
+
+class RoundTripRetryTests(unittest.TestCase):
+    """输入：第一轮程序全过但读者答错、第二轮整段退化的假客户端。输出：rejects 行。
+
+    预期：rejects 里记的是**被选中那一轮**的原因（读者答错），不是第二轮退化的原因。
+    """
+
+    class _DegradingClient:
+        """输入：无。输出：第一轮规范、第二轮吐散文的假客户端；读者轮固定答错。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.answer = ""
+
+        def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
+            """输入：messages。输出：按角色与轮次给出的响应。"""
+            self.calls += 1
+            payload = payload_of(messages)
+            if "answer" not in payload:  # 读者轮：只有 stem / options
+                # 错答案要**在题干里找得到出处**，否则按「读者在猜」处理、不否决（见 roundtrip 模块）。
+                wrong = read_wrong_answer_from_stem(self.answer, _last_json_object(messages))
+                return Completion(ok=True, text=json.dumps({"answer": wrong}, ensure_ascii=False),
+                                  provider="scripted", model="m")
+            self.answer = str(payload["answer"])
+            if self.calls == 1:
+                return Completion(ok=True, text=compliant_body(payload), provider="scripted", model="m")
+            return Completion(ok=True, text="题目要求从下列汉字中选出答案。",
+                              provider="scripted", model="m")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.data = self.dir / "chars.jsonl"
+        write_chars(self.data)
+
+    def test_reject_keeps_the_best_round_reason(self) -> None:
+        from hanzi_synth.verify.checks import ROUNDTRIP_FEEDBACK_KEY
+
+        out = self.dir / "degrade.jsonl"
+        stats = run_pipeline(
+            PipelineConfig(limit=1, out_path=out, data_path=self.data, seed=7, retries=1, roundtrip=True),
+            client=self._DegradingClient(),
+        )
+        self.assertEqual(stats["ok"], 0)
+        self.assertEqual(stats["rejected"], 1)
+        rows = [
+            json.loads(line)
+            for line in out.with_suffix(".rejects.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(
+            any(ROUNDTRIP_FEEDBACK_KEY in failure for failure in rows[0]["failures"]),
+            rows[0]["failures"],
+        )
+        attempts = [
+            json.loads(line)
+            for line in out.with_suffix(".attempts.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(attempts[0]["chosen"])
+        self.assertFalse(attempts[1].get("chosen", False))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1018,11 +1146,27 @@ def read_answer_from_stem(expected: str, body: dict) -> str:
     return expected
 
 
-def read_nothing_from_stem(_expected: str, _body: dict) -> str:
-    """输入：定死的答案 + 载荷。输出：一个读不出答案的读者会说的话。
-    预期：与 `read_answer_from_stem` 成对，用来钉「答错就不发布」那一半接线。
+def read_wrong_answer_from_stem(expected: str, body: dict) -> str:
+    """输入：定死的答案 + 往返检验载荷。输出：一个**在题干里找得到出处**的错答案。
+
+    预期：钉住「题干把读者带偏了」那一半接线——读者照着题干里的料答错了（选了题干列出的
+          另一个候选，或抄了题干里的值）。与「读者凭空猜一个值」分开：后者不否决，
+          见 `llm.roundtrip._traceable_to_stem`（汉字题一大类是知识题，2B 编值是常态）。
     """
+    options = [str(item) for item in (body.get("options") or []) if item and str(item) != expected]
+    if options:
+        return options[0]
+    for char in reversed(str(body.get("stem") or "")):
+        if char.strip() and char != expected:
+            return char
     return "读不出答案"
+
+
+def read_guessed_answer_from_stem(_expected: str, _body: dict) -> str:
+    """输入：定死的答案 + 载荷。输出：一个题干里根本没有的值（读者自己编的）。
+    预期：与 `read_wrong_answer_from_stem` 成对，用来钉「猜出来的值不否决」那一半接线。
+    """
+    return "E1A0"
 
 
 class RoundTripGateTests(unittest.TestCase):
@@ -1078,9 +1222,252 @@ class RoundTripGateTests(unittest.TestCase):
         return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
 
     def test_wrong_reader_answer_blocks_publication(self) -> None:
-        """读者答出的不是定死的答案 → 这道题没被发布（进 rejects，不丢）。"""
-        self.assertEqual(self._run(read_nothing_from_stem, "wrong.jsonl"), [])
+        """读者照着题干里的料答错（选了另一个候选 / 抄了题干里的值）→ 这道题没被发布。"""
+        self.assertEqual(self._run(read_wrong_answer_from_stem, "wrong.jsonl"), [])
+
+    def test_a_guessed_answer_does_not_block_publication(self) -> None:
+        """读者凭空编一个题干里没有的值 → 不否决：那是读者的知识缺口，不是题目的毛病。"""
+        self.assertEqual(len(self._run(read_guessed_answer_from_stem, "guessed.jsonl")), 1)
 
     def test_correct_reader_answer_is_published(self) -> None:
         """读者答出了定死的答案 → 照常发布。判据比对的是载荷里定死的答案，不是模型的偏好。"""
         self.assertEqual(len(self._run(read_answer_from_stem, "right.jsonl")), 1)
+
+
+class AnswerArbitrationWiringTests(unittest.TestCase):
+    """输入：同时扮措辞 / 读者 / 仲裁三个角色的假客户端。输出：发不发布。
+
+    预期：**答案仲裁不受 `--judge` 开关控制**——读者答出的是一句自然语言，与程序定死的答案
+          对不上时要用 LLM 判「是不是同一个答案」（只做子串比对等于把自然语言当字符串）。
+          判据仍是先规则后仲裁：子串比对过了就不发仲裁请求，一次配额都不多花。
+          读者自报「缺条件」还要过旁证：机械闸门确认题面写全了识别条件时按误报处理。
+    """
+
+    class _TripleClient:
+        """输入：读者函数 + 仲裁结论。输出：假客户端。
+
+        预期：一个客户端扮三个角色，靠载荷形状分流——L3 载荷带 `answer`、答案仲裁载荷带
+              `expected`、往返检验载荷两者都没有（只有 stem / options）。
+        """
+
+        def __init__(self, reader, equivalent: bool = True) -> None:
+            self._reader = reader
+            self._equivalent = equivalent
+            self.answer = ""
+            self.arbitrations = 0
+
+        def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
+            """输入：messages。输出：按载荷形状分流后的响应。"""
+            # `payload_of` 只认带 `answer` 的 L3 载荷，所以另外两种载荷先按形状认出来。
+            body = _last_json_object(messages)
+            if "expected" in body:  # 答案仲裁：载荷里带标准答案
+                self.arbitrations += 1
+                return Completion(
+                    ok=True,
+                    text=json.dumps({"equivalent": self._equivalent, "reason": "夹具结论"}),
+                    provider="scripted", model="m",
+                )
+            payload = payload_of(messages)
+            if not payload:  # 往返检验：只有 stem / options，没有 answer
+                return Completion(
+                    ok=True,
+                    text=json.dumps({"answer": self._reader(self.answer, body)}, ensure_ascii=False),
+                    provider="scripted", model="m",
+                )
+            self.answer = str(payload["answer"])
+            return Completion(ok=True, text=compliant_body(payload), provider="scripted", model="m")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.data = self.dir / "chars.jsonl"
+        write_chars(self.data)
+
+    def _run(self, client, name: str) -> list[dict]:
+        """输入：假客户端 + 产出文件名。输出：发布出来的记录。预期：`--judge` 一律不传。"""
+        out = self.dir / name
+        config = PipelineConfig(
+            limit=1, out_path=out, data_path=self.data, seed=7, retries=0, roundtrip=True,
+        )
+        run_pipeline(config, client=client)
+        if not out.exists():
+            return []
+        return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_equivalent_rewrite_is_published_without_the_judge_switch(self) -> None:
+        """没开 `--judge`：读者答的是题干里的料（只是写法不同），仲裁判等价 → 照样发布。"""
+        client = self._TripleClient(read_wrong_answer_from_stem)
+        rows = self._run(client, "arb_pass.jsonl")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(client.arbitrations, 1)
+        self.assertIn("LLM 仲裁", rows[0]["roundtrip"]["answer_checked"])
+
+    def test_arbiter_rejection_keeps_the_record_out(self) -> None:
+        """读者答的是题干里的料、仲裁判「与标准答案不是一回事」→ 不进产出（进 rejects，不丢）。"""
+        client = self._TripleClient(read_wrong_answer_from_stem, equivalent=False)
+        self.assertEqual(self._run(client, "arb_reject.jsonl"), [])
+
+    def test_rule_pass_never_calls_the_arbiter(self) -> None:
+        """子串比对过了就过：一次仲裁请求都不该多花（优先规则，然后 LLM judge）。"""
+        client = self._TripleClient(read_answer_from_stem)
+        rows = self._run(client, "arb_rule.jsonl")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(client.arbitrations, 0)
+
+    def test_missing_condition_self_report_is_corroborated(self) -> None:
+        """读者自报「缺条件」，但机械闸门确认题干写全了识别条件 → 按误报处理，照样发布。"""
+        client = self._TripleClient(lambda _expected, _body: "缺条件")
+        rows = self._run(client, "arb_missing.jsonl")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("不予否决", rows[0]["roundtrip"]["answer_checked"])
+
+
+class SemanticAnswerWiringTests(unittest.TestCase):
+    """输入：机械闸门结论 + 假仲裁客户端。输出：修正过的结论。
+
+    预期：`answer_in_explanation` 只做**快速通过**——子串没过、而且**只有这一条没过**时才问 LLM；
+          别的闸门也挂了就不花这次配额（救回来照样发布不了）；仲裁缺席维持机械结论（工具问题
+          不判数据死刑，也不放行）。
+    """
+
+    class _Arbiter:
+        """输入：预设正文。输出：假仲裁客户端。预期：记录调用次数，用来钉「什么时候不该问」。"""
+
+        def __init__(self, text: str) -> None:
+            self._text = text
+            self.calls = 0
+
+        def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
+            self.calls += 1
+            return Completion(ok=True, text=self._text, provider="scripted", model="m")
+
+    @staticmethod
+    def _spec():
+        return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="xié")
+
+    @staticmethod
+    def _verdict(explanation: str = "「㐑」读作别的音。"):
+        """输入：解析。输出：只差 `answer_in_explanation` 一条的机械结论。
+
+        预期：用真的 `verify` 造夹具——手搓 `Verification` 会把 `failures` / `notes` 的配对写错，
+              而修正那一支正是按这两份同源文本撤的。
+        """
+        return verify(
+            SemanticAnswerWiringTests._spec(),
+            Verbalized(ok=True, stem="「㐑」的读音是什么？", explanation=explanation),
+        )
+
+    def test_semantic_pass_lifts_the_substring_failure(self) -> None:
+        """解析里没有答案串（子串闸门不过），语义核验判「解析说的就是标准答案」→ 撤掉那条失败。"""
+        arbiter = self._Arbiter('{"states_answer": true, "stated": "xié", "reason": "换了个说法"}')
+        result = _verified_with_semantic_answer(self._verdict(), self._spec(), None, arbiter)
+        self.assertTrue(result.answer_in_explanation)
+        self.assertEqual(result.tier, "A")
+        self.assertEqual(result.failures, ())
+        self.assertEqual(result.notes, ())
+        self.assertIn("LLM 仲裁", result.semantic_answer)
+
+    def test_semantic_veto_keeps_the_failure(self) -> None:
+        """语义核验判「解析没说答案」→ 失败照旧留着，理由落进 `semantic_answer`。"""
+        arbiter = self._Arbiter('{"states_answer": false, "stated": "", "reason": "解析没说答案"}')
+        result = _verified_with_semantic_answer(self._verdict(), self._spec(), None, arbiter)
+        self.assertFalse(result.answer_in_explanation)
+        self.assertEqual(result.tier, "C")
+        self.assertTrue(result.failures)
+        self.assertIn("解析没说答案", result.semantic_answer)
+
+    def test_absent_arbiter_keeps_the_mechanical_verdict(self) -> None:
+        """仲裁跑挂了（输出不是 JSON）→ 维持机械结论，理由里留下缺席痕迹。"""
+        arbiter = self._Arbiter("这不是 JSON")
+        before = self._verdict()
+        result = _verified_with_semantic_answer(before, self._spec(), None, arbiter)
+        self.assertEqual(result.tier, "C")
+        self.assertEqual(result.failures, before.failures)
+        self.assertIn("仲裁缺席", result.semantic_answer)
+
+    def test_fast_pass_never_calls_the_arbiter(self) -> None:
+        """子串比对过了就不问 LLM：一次配额都不该多花。"""
+        arbiter = self._Arbiter('{"states_answer": false, "reason": "夹具乱判"}')
+        before = self._verdict("「㐑」读作 xié。")
+        self.assertTrue(before.answer_in_explanation)
+        result = _verified_with_semantic_answer(before, self._spec(), None, arbiter)
+        self.assertEqual(result.semantic_answer, "")
+        self.assertEqual(arbiter.calls, 0)
+
+    def test_other_failures_skip_the_semantic_check(self) -> None:
+        """别的闸门也挂了 → 这一条救回来照样发布不了，不花配额。"""
+        arbiter = self._Arbiter('{"states_answer": true, "reason": "夹具乱判"}')
+        verdict = verify(
+            self._spec(),
+            Verbalized(ok=True, stem="What is the reading?", explanation="「㐑」读作别的音。"),
+        )
+        self.assertTrue(len(verdict.failures) > 1, verdict.failures)
+        result = _verified_with_semantic_answer(verdict, self._spec(), None, arbiter)
+        self.assertEqual(result.failures, verdict.failures)
+        self.assertEqual(arbiter.calls, 0)
+
+    def test_no_client_keeps_the_mechanical_verdict(self) -> None:
+        """没接客户端（offline）→ 只有子串比对，结论原样。"""
+        before = self._verdict()
+        result = _verified_with_semantic_answer(before, self._spec(), None, None)
+        self.assertEqual(result.failures, before.failures)
+        self.assertEqual(result.semantic_answer, "")
+
+
+class _SemanticAnswerClient:
+    """输入：语义核验的结论。输出：同时扮 L3 与语义核验两个角色的假客户端。
+
+    预期：L3 那一轮返回一份**解析里不写答案串**的规范正文（子串闸门必然不过），语义核验那一轮
+          返回给定结论。靠载荷形状分流：语义核验的载荷带 `explanation`，L3 的带 `facts`。
+    """
+
+    def __init__(self, verdict: str) -> None:
+        self._verdict = verdict
+        self.semantic_calls = 0
+
+    def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
+        body = _last_json_object(messages)
+        if "explanation" in body:  # 语义核验：载荷里只有解析与答案
+            self.semantic_calls += 1
+            return Completion(ok=True, text=self._verdict, provider="scripted", model="m")
+        payload = payload_of(messages)
+        data = json.loads(compliant_body(payload))
+        data["explanation"] = "这个字读作某个音。"  # 故意不写答案串
+        return Completion(ok=True, text=json.dumps(data, ensure_ascii=False), provider="scripted", model="m")
+
+
+class SemanticAnswerEndToEndTests(unittest.TestCase):
+    """输入：解析里不写答案串的假客户端。输出：发不发布。预期：语义核验说了算。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.data = self.dir / "chars.jsonl"
+        write_chars(self.data)
+
+    def _run(self, client, name: str) -> list[dict]:
+        """输入：假客户端 + 产出文件名。输出：发布出来的记录。预期：不开往返检验，只钉这一条接线。"""
+        out = self.dir / name
+        run_pipeline(
+            PipelineConfig(limit=1, out_path=out, data_path=self.data, seed=7, retries=0),
+            client=client,
+        )
+        if not out.exists():
+            return []
+        return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_semantic_pass_publishes_with_a_trace(self) -> None:
+        """子串闸门不过、语义核验判过 → 照样发布，并把仲裁痕迹落进 verification。"""
+        client = _SemanticAnswerClient('{"states_answer": true, "stated": "xié", "reason": "换了个说法"}')
+        rows = self._run(client, "sem_pass.jsonl")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(client.semantic_calls, 1)
+        self.assertTrue(rows[0]["verification"]["answer_in_explanation"])
+        self.assertIn("LLM 仲裁", rows[0]["verification"]["semantic_answer"])
+
+    def test_semantic_veto_keeps_the_record_out(self) -> None:
+        """语义核验判「解析没说答案」→ 不进产出（进 rejects，不丢）。"""
+        client = _SemanticAnswerClient('{"states_answer": false, "reason": "解析没说答案"}')
+        self.assertEqual(self._run(client, "sem_reject.jsonl"), [])

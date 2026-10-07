@@ -27,7 +27,7 @@ CONSTRUCTOR_VERSION = "0.2.0"
 # 问 IDS 拆写的题（T3 正向 / T13 反向）题干至少要命中其中一个说法：这是「问的必须是
 # 答案那件事」的闸门。答案是 IDS 拆解，题干写「请问这个字是什么？」就是在问那个字本身
 # （实测 16j 漏网）；T3 还漏过「问这个字一共有几画」这种换了问题的产出。
-_ASK_MARKERS = ("IDS", "拆解", "拆写", "表意文字描述序列")
+_ASK_MARKERS = ("拆解", "拆写", "结构拆解", "表意文字描述序列")
 
 # T1 的题干闸门：答案是**笔画数**，题干至少要命中一个「问笔画」的说法。实测第十轮真机的
 # T1 U0340A 题干写「请写出它的正确读音。这个字的ID是 ⿱士乙。请写出这个字的拼音是什么？
@@ -92,7 +92,7 @@ def build_stroke_total(
     return TaskSpec(
         task_id="T1_stroke_total",
         instruction=(
-            "Ask the reader how many strokes the character shown in stem_must_contain has in total."
+            f"Ask the reader how many strokes in total the character 「{character.zi}」 has."
         ),
         facts={
             "zi": character.zi,
@@ -130,8 +130,8 @@ def build_ids_forward(
     return TaskSpec(
         task_id="T3_ids_forward",
         instruction=(
-            "Ask the reader how the character shown in stem_must_contain is written as an IDS "
-            "(ideographic description sequence) decomposition."
+            f"Ask the reader to write out the component structure of the character 「{character.zi}」 "
+            "as one structural notation string."
         ),
         facts={"zi": character.zi, "ids": list(character.ids_candidates), "stroke_total": character.stroke_total},
         answer=canonical,
@@ -140,7 +140,7 @@ def build_ids_forward(
         visible_subject=character.zi,
         stem_asks_any=_ASK_MARKERS,
         distractors=distractors,
-        proof=(f"这个字的 IDS 拆解是 {shown}",),
+        proof=(f"这个字的结构拆解写作 {shown}",),
         provenance=make_provenance(character, "T3_ids_forward", CONSTRUCTOR_VERSION, rng.randrange(1 << 30)),
     )
 
@@ -224,8 +224,8 @@ def build_ids_reverse(
     return TaskSpec(
         task_id="T13_ids_reverse",
         instruction=(
-            "Ask the reader for the IDS decomposition of the character that the reading and the "
-            "meaning shown in the stem identify."
+            "Ask the reader to write out the component structure of the character that the reading "
+            "and the meaning in the stem identify."
         ),
         facts={
             "meaning_source": source,
@@ -245,6 +245,6 @@ def build_ids_reverse(
         structure_words=structure_words(character),
         distractors=distractors,
         slots=("stem", "explanation"),
-        proof=(f"这个字的 IDS 拆解是 {shown}",),
+        proof=(f"这个字的结构拆解写作 {shown}",),
         provenance=make_provenance(character, "T13_ids_reverse", CONSTRUCTOR_VERSION, rng.randrange(1 << 30)),
     )

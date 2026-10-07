@@ -11,9 +11,14 @@ from hanzi_synth.config import ProviderConfig
 from hanzi_synth.llm.provider import ChatClient, Completion
 from hanzi_synth.llm.ratelimit import SlidingWindowLimiter
 from hanzi_synth.llm.roundtrip import (
+    _EQUIV_SYSTEM_PROMPT,
     answer_matches,
     build_roundtrip_messages,
+    build_states_answer_messages,
+    explanation_states_answer,
+    reader_answer_ok,
     roundtrip_answer,
+    subject_identified_by_gates,
 )
 from hanzi_synth.llm.thinking import strip_thinking
 from hanzi_synth.llm.verbalizer import (
@@ -27,6 +32,7 @@ from hanzi_synth.llm.verbalizer import (
     verbalize_batch,
 )
 from hanzi_synth.tasks.base import TaskSpec
+from hanzi_synth.verify.checks import Verification
 
 
 
@@ -344,6 +350,27 @@ class ChatClientTests(unittest.TestCase):
         self.assertNotIn("max_tokens", captured)
         self.assertEqual(set(captured), {"model", "messages", "temperature"})
 
+    def test_reasoning_effort_is_sent_only_when_configured(self) -> None:
+        """provider 配了 `reasoning_effort` 才发这个字段。
+
+        预期：没配 = 请求体里没有它（不认这个字段的端点不会因为未知字段吃 400）；
+              配了 = 原样带上。实测本地 LM Studio 靠它把往返检验从 325 秒压到 0.6 秒。
+        """
+        plain = ProviderConfig(name="p1", base_url="http://p1.test/v1", model="m", api_key="k", rpm=0)
+        capped = ProviderConfig(name="p2", base_url="http://p2.test/v1", model="m", api_key="k", rpm=0,
+                                reasoning_effort="none")
+        captured: list[dict] = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured.append(dict(json or {}))
+            return FakeResponse(200, payload={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {}})
+
+        with mock.patch("requests.post", side_effect=fake_post):
+            ChatClient([plain], timeout=1.0, max_retries=0, backoff=0.01).complete([{"role": "user", "content": "hi"}])
+            ChatClient([capped], timeout=1.0, max_retries=0, backoff=0.01).complete([{"role": "user", "content": "hi"}])
+        self.assertNotIn("reasoning_effort", captured[0])
+        self.assertEqual(captured[1]["reasoning_effort"], "none")
+
     def test_repr_hides_api_key(self) -> None:
         """ProviderConfig 的 repr 不能暴露密钥。"""
         provider = ProviderConfig(name="p", base_url="http://x", model="m", api_key="sk-secret")
@@ -431,7 +458,7 @@ class JudgeTests(unittest.TestCase):
         # 否则裁判会把每一道合法的反向题都否掉。
         criteria = dict(JUDGE_CRITERIA)
         self.assertIn("反向题", criteria["unambiguous"])
-        self.assertIn("不要求题干写出答案本身", criteria["self_sufficient"])
+        self.assertIn("不要求 `stem` 写出答案本身", criteria["self_sufficient"])
         for _name, text in JUDGE_CRITERIA:
             self.assertIn(text, JUDGE_SYSTEM_PROMPT)
             self.assertIn(text, SYSTEM_PROMPT)
@@ -504,6 +531,26 @@ class PromptInvariantTests(unittest.TestCase):
             hit = _TASK_CODE_RE.search(blob)
             self.assertIsNone(hit, f"{spec.task_id} 的载荷里出现题型代号 {hit and hit.group(0)!r}")
 
+    def test_writer_prompt_shows_no_copyable_internal_word(self) -> None:
+        """措辞提示词里不许出现 `_INTERNAL_TERMS` 里的**中文**词。
+
+        实测：提示词里写「题干」，2B 就写「题干中提到了「上边」」；写「请在提供的汉字中找出」，
+        它就原样抄进产出。产出必须上下文无关，所以提示词一律用**键名**（stem / explanation）
+        指代产出，一个可抄的中文样本都不给。ASCII 字段名（facts / instruction）必须留着——
+        模型要读它们，而且它们出现在中文散文里会被 `no_field_names` / `no_internal_terms` 挡下。
+        """
+        from hanzi_synth.llm.verbalizer import BATCH_SUFFIX, FEEDBACK_FOOTER, FEEDBACK_HEADER, SYSTEM_PROMPT
+        from hanzi_synth.verify.checks import _INTERNAL_TERMS
+
+        chinese_terms = [term for term in _INTERNAL_TERMS if not term.isascii()]
+        self.assertTrue(chinese_terms, "内部词表里应当有中文词，否则这条闸门形同虚设")
+        for term in chinese_terms:
+            for label, text in (
+                ("SYSTEM_PROMPT", SYSTEM_PROMPT), ("BATCH_SUFFIX", BATCH_SUFFIX),
+                ("FEEDBACK_HEADER", FEEDBACK_HEADER), ("FEEDBACK_FOOTER", FEEDBACK_FOOTER),
+            ):
+                self.assertNotIn(term, text, f"{label} 里出现了可抄的内部词 {term!r}")
+
     def test_payload_carries_avoid_openings(self) -> None:
         """`avoid_openings` 是**负例**：同题型已经用过的开头喂回去，模型才知道要换一种说法。"""
         from hanzi_synth.llm.verbalizer import payload_for
@@ -513,6 +560,16 @@ class PromptInvariantTests(unittest.TestCase):
         payload = payload_for(spec, ("请问", "下面"))
         self.assertEqual(payload["avoid_openings"], ["请问", "下面"])
         self.assertEqual(payload_for(spec)["avoid_openings"], [])
+
+    def test_arbiter_prompt_separates_writing_style_from_values(self) -> None:
+        """仲裁提示必须写清「只差分隔符 / 大小写才是等价，值不同就是不等价」。
+
+        实测 2B 把 `E2 82 AC` 判成与 `E3 90 89` 等价（理由是「分隔符和大小写不同」）——
+        仲裁太松的另一面：会把错的答案留在数据里。所以提示里要有正反两个例子，并要求拿不准判 false。
+        """
+        self.assertIn("E3 90 89", _EQUIV_SYSTEM_PROMPT)
+        self.assertIn("E2 82 AC", _EQUIV_SYSTEM_PROMPT)
+        self.assertIn("拿不准时判 false", _EQUIV_SYSTEM_PROMPT)
 
 
 class RoundTripTests(unittest.TestCase):
@@ -558,6 +615,22 @@ class RoundTripTests(unittest.TestCase):
         """载荷里 `accepted` 是同一件事的合法写法，逐个试。"""
         self.assertTrue(answer_matches(self._spec(), "E3 90 91"))
 
+    def test_machine_values_match_after_separator_and_case_normalisation(self) -> None:
+        """编码串的写法差异只有分隔符与大小写：`E39089` = `E3 90 89`，不必问模型。"""
+        spec = TaskSpec(task_id="T_test", instruction="i", facts={}, answer="E3 90 89")
+        for text in ("E39089", "e3 90 89", "「E39089」"):
+            self.assertTrue(answer_matches(spec, text), text)
+
+    def test_a_different_machine_value_is_not_a_match(self) -> None:
+        """差一位就是另一个值——这是「写法不同」与「答成别的」的分界。"""
+        spec = TaskSpec(task_id="T_test", instruction="i", facts={}, answer="E3 90 89")
+        self.assertFalse(answer_matches(spec, "E2 82 AC"))
+
+    def test_codepoint_prefix_is_normalised(self) -> None:
+        """`U+3408` 与 `3408` 是同一个码位。"""
+        spec = TaskSpec(task_id="T_test", instruction="i", facts={}, answer="U+3408")
+        self.assertTrue(answer_matches(spec, "3408"))
+
     def test_wrong_or_empty_answer_is_rejected(self) -> None:
         """答成别的字 / 答不出：判否——这正是「读者读不懂」的可判定形式。"""
         for text in ("㐒", "", "我不确定"):
@@ -582,30 +655,365 @@ class RoundTripTests(unittest.TestCase):
         分不出「请列出所有候选」是题目的一部分还是写作要求。
         """
         result = roundtrip_answer(
-            self._client('{"answer": "㐑", "asks_reader_only": false, "note": "题干里有「请列出所有候选」"}'),
+            self._client('{"answer": "㐑", "writer_phrases": ["请列出所有候选"], "note": "题干里有要求句"}'),
             self._spec(),
             self._verbalized(),
         )
         self.assertFalse(result.ok)
-        self.assertFalse(result.asks_reader_only)
+        self.assertEqual(result.writer_phrases, ("请列出所有候选",))
         self.assertFalse(result.absent)
 
-    def test_missing_reader_only_field_is_not_a_veto(self) -> None:
-        """字段缺席按 true 处理——「缺席不否决」是这一层的总规矩（老记录 / 模型漏字段都不该判死）。"""
-        result = roundtrip_answer(self._client('{"answer": "㐑"}'), self._spec(), self._verbalized())
-        self.assertTrue(result.ok)
-        self.assertTrue(result.asks_reader_only)
-
-    def test_verdict_records_both_natural_language_judgements(self) -> None:
-        """落盘的判定里必须带 `asks_reader_only`：事后审计要能看出「这题当时被判过什么」。"""
+    def test_statement_instead_of_a_question_is_vetoed(self) -> None:
+        """题干只是陈述（读者没有要回答的东西）→ 否决。"""
         result = roundtrip_answer(
-            self._client('{"answer": "㐑", "is_question": false, "asks_reader_only": true}'),
+            self._client('{"is_question": false, "identifies_subject": true, "answer": "㐑"}'),
             self._spec(),
             self._verbalized(),
         )
         self.assertFalse(result.ok)
-        self.assertFalse(result.as_dict()["is_question"])
-        self.assertTrue(result.as_dict()["asks_reader_only"])
+        self.assertFalse(result.is_question)
+
+    def test_stem_without_its_subject_is_vetoed(self) -> None:
+        """题干没说清问的是哪个字 → 否决（读者只能自报「缺条件」）。"""
+        result = roundtrip_answer(
+            self._client('{"is_question": true, "identifies_subject": false, "answer": "缺条件"}'),
+            self._spec(),
+            self._verbalized(),
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse(result.identifies_subject)
+
+    def test_knowledge_question_is_not_vetoed(self) -> None:
+        """知识题（题干说清了问哪个字，读者没有那个字的知识）**不否决**。
+
+        实测：几画 / 读音 / 码位 / 第几页这类题，读者一律自报「知识题」——
+        早先的版本把它当「答不出」全判死，16 题型探针里 10 条里绝大多数是这种误杀。
+        """
+        result = roundtrip_answer(
+            self._client('{"is_question": true, "identifies_subject": true, "answer": "知识题"}'),
+            self._spec(),
+            self._verbalized(),
+        )
+        self.assertTrue(result.ok)
+        self.assertFalse(result.absent)
+
+    def test_missing_judgement_fields_are_not_a_veto(self) -> None:
+        """四个判据字段缺席时一律按「不否决」处理——「缺席不否决」是这一层的总规矩。
+
+        预期：布尔字段缺席按 true、`writer_phrases` 缺席按空数组、`answer` 缺席按不比对；
+              老记录 / 模型漏字段都不该把一道好题判死。
+        """
+        result = roundtrip_answer(self._client('{"note": "模型只回了一句"}'), self._spec(), self._verbalized())
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_question)
+        self.assertTrue(result.identifies_subject)
+        self.assertEqual(result.writer_phrases, ())
+
+    def test_reader_answer_ok_separates_knowledge_from_missing_condition(self) -> None:
+        """两种「答不出来」必须分开：知识题放行、缺条件否决。"""
+        spec = self._spec()
+        self.assertTrue(reader_answer_ok(spec, "知识题"))
+        self.assertFalse(reader_answer_ok(spec, "缺条件"))
+        self.assertTrue(reader_answer_ok(spec, "答案是㐑"))
+        self.assertFalse(reader_answer_ok(spec, "㐒"))
+
+    def test_verdict_records_every_judgement(self) -> None:
+        """落盘的判定里必须带全部判据：事后审计要能看出「这题当时被判过什么」。"""
+        result = roundtrip_answer(
+            self._client('{"answer": "㐑", "is_question": false, "identifies_subject": true, "writer_phrases": []}'),
+            self._spec(),
+            self._verbalized(),
+        )
+        dumped = result.as_dict()
+        self.assertFalse(result.ok)
+        self.assertFalse(dumped["is_question"])
+        self.assertTrue(dumped["identifies_subject"])
+        self.assertEqual(dumped["writer_phrases"], [])
+        self.assertIn("answer", dumped)
+
+
+class AnswerArbitrationTests(unittest.TestCase):
+    """输入：读者答出另一种写法 + 仲裁客户端。输出：判定。
+
+    预期：答案比对**快速通过 → LLM 判定**——子串比对过了就不再花配额；对不上时判定权交给 LLM
+           「读者写的这句自然语言与标准答案是不是一回事」。只做子串比对等于把自然语言当字符串，
+           读者的合理写法（`xie2` / `xié`）会被误杀。
+    """
+
+    @staticmethod
+    def _spec(answer: str = "㐑"):
+        return TaskSpec(task_id="T_test", instruction="i", facts={}, answer=answer)
+
+    @staticmethod
+    def _client(*texts: str):
+        """输入：按顺序吐出的正文。输出：假客户端。预期：记录调用次数，用尽后返回失败。"""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.texts = list(texts)
+                self.calls = 0
+
+            def complete(self, messages, *, temperature: float = 0.6, extra=None):
+                self.calls += 1
+                if not self.texts:
+                    return Completion(ok=False, text="", provider="p", model="m", error="exhausted")
+                return Completion(ok=True, text=self.texts.pop(0), provider="p", model="m")
+
+        return _Client()
+
+    @staticmethod
+    def _verbalized(stem: str = "「㐑」是什么"):
+        """输入：题干（默认是最朴素的一问）。输出：一份 L3 产出替身。预期：只读 stem / explanation。"""
+
+        class _V:
+            pass
+
+        _V.stem = stem
+        _V.explanation = "答案是「㐑」"
+        return _V()
+
+    def test_rule_pass_does_not_call_the_arbiter(self) -> None:
+        """子串比对过了就是过了：一次请求都不该多花（优先规则，然后 LLM judge）。"""
+        client = self._client('{"answer": "㐑"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized(), answer_judge=client)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.answer_checked, "规则：快速通道")
+        self.assertEqual(client.calls, 1)
+
+    def test_equivalent_rewrite_is_accepted_by_the_arbiter(self) -> None:
+        """读者答的是题干里的料（同一个读音的另一种写法）→ 仲裁判等价 → 放行，并留下仲裁痕迹。
+
+        仲裁只在**答案在题干里找得到出处**时才发生（读者在猜的不送仲裁，见 `_traceable_to_stem`），
+        所以夹具的题干里要写着那个值。
+        """
+        client = self._client('{"answer": "xie2"}', '{"equivalent": true, "reason": "声调符号与数字写法同音"}')
+        result = roundtrip_answer(
+            client, self._spec("xié"), self._verbalized("「㐑」读作 xie2 吗？"), answer_judge=client
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("LLM 仲裁", result.answer_checked)
+        self.assertEqual(client.calls, 2)
+
+    def test_machine_value_needs_a_comparable_reading_from_the_arbiter(self) -> None:
+        """机器值也送仲裁，但仲裁必须**解析出可比对的写法**——给不出来按缺席处理，退回快速通道。
+
+        实测 2B 判「写法不同」会把 `E4 B1 91` 说成与 `E3 90 89` 等价（理由「只是分隔符和大小写
+        不同」），所以机器值的逐位比对由程序做：仲裁只负责把读者写的自然语言照抄成标准答案的
+        写法（`reader_value`），且那个写法必须在**读者原话里找得到**——挡「把标准答案抄一遍」。
+        夹具只给 `equivalent`、不给 `reader_value`，正是「解析不出来」的那种输出。
+        """
+        client = self._client('{"answer": "E4 B1 91"}', '{"equivalent": true, "reason": "夹具乱判"}')
+        result = roundtrip_answer(
+            client, self._spec("E3 90 89"),
+            self._verbalized("「㐉」的编码是 E4 B1 91，请写出它的十六进制字节序列。"),
+            answer_judge=client,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(client.calls, 2)
+        self.assertIn("仲裁缺席", result.answer_checked)
+
+    def test_a_copied_machine_value_is_not_a_reading(self) -> None:
+        """仲裁把标准答案抄进 `reader_value`（读者原话里没有它）→ 不算解析，按缺席处理。
+
+        这是「语义解析 + 逐位比对」的防抄底线：没有它，一个乱判的仲裁只要把标准答案复述一遍
+        就能把错的答案洗成对的。
+        """
+        client = self._client(
+            '{"answer": "E4 B1 91"}',
+            '{"reader_value": "E3 90 89", "equivalent": true, "reason": "夹具抄答案"}',
+        )
+        result = roundtrip_answer(
+            client, self._spec("E3 90 89"),
+            self._verbalized("「㐉」的编码是 E4 B1 91，请写出它的十六进制字节序列。"),
+            answer_judge=client,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("仲裁缺席", result.answer_checked)
+
+    def test_a_guessed_answer_does_not_block_publication(self) -> None:
+        """读者凭空编一个题干里没有的值 → 不否决，并把原因留在记录里。
+
+        汉字题一大类是知识题（几画 / 读音 / 码位 / 第几页），2B 读者没有那些知识，编一个值
+        出来是常态（实测 T14「码位是多少」被编出 `E1A0`）；否决它等于把好题丢掉。
+        """
+        client = self._client('{"answer": "E1A0"}')
+        result = roundtrip_answer(
+            client, self._spec("U+3408"), self._verbalized("请问「㐈」的 Unicode 码位是多少？"),
+            answer_judge=client,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("没有出处", result.answer_checked)
+
+    def test_arbiter_rejection_keeps_the_veto(self) -> None:
+        """仲裁判不等价 → 仍然否决：仲裁只把「写法不同」与「答成别的」分开。"""
+        client = self._client('{"answer": "qiú"}', '{"equivalent": false, "reason": "读音不同"}')
+        result = roundtrip_answer(
+            client, self._spec("xié"), self._verbalized("「㐑」读作 qiú 吗？"), answer_judge=client
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse(result.absent)
+
+    def test_absent_arbiter_falls_back_to_the_rule(self) -> None:
+        """仲裁跑挂了（输出不是 JSON）→ 退回规则结论，不因此放行。"""
+        client = self._client('{"answer": "xie2"}', "我不知道")
+        result = roundtrip_answer(
+            client, self._spec("xié"), self._verbalized("「㐑」读作 xie2 吗？"), answer_judge=client
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("仲裁缺席", result.answer_checked)
+
+    def test_self_reported_classification_is_not_arbitrated(self) -> None:
+        """「知识题 / 缺条件」是读者的**分类**不是答案——不送仲裁，一次请求都不多花。"""
+        client = self._client('{"answer": "知识题"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized(), answer_judge=client)
+        self.assertTrue(result.ok)
+        self.assertEqual(client.calls, 1)
+
+    def test_without_arbiter_the_rule_still_vetoes(self) -> None:
+        """没给仲裁客户端：只有快速通道——读者照着题干里的料答错就否决（题干把读者带偏了）。"""
+        client = self._client('{"answer": "xie2"}')
+        result = roundtrip_answer(client, self._spec("xié"), self._verbalized("「㐑」读作 xie2 吗？"))
+        self.assertFalse(result.ok)
+        self.assertIn("题干把读者带偏了", result.answer_checked)
+
+
+class ExplanationStatesAnswerTests(unittest.TestCase):
+    """输入：解析 + 仲裁客户端。输出：解析有没有说出标准答案。
+
+    预期：这是 `answer_in_explanation`（子串比对）的**语义那一半**——子串判得了「解析里有没有
+          那串字」，判不了「解析说的是不是那个答案」：「这个字的读音不是 xié」带着答案串却把答案
+          说反了。仲裁缺席（跑挂了 / 输出不合法）返回 None，调用方维持机械结论。
+    """
+
+    @staticmethod
+    def _spec():
+        return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="xié")
+
+    @staticmethod
+    def _client(text: str):
+        class _Client:
+            def complete(self, messages, *, temperature: float = 0.6, extra=None):
+                return Completion(ok=True, text=text, provider="p", model="m")
+        return _Client()
+
+    @staticmethod
+    def _verbalized(explanation: str = "「㐑」读作 xié。"):
+        """输入：解析。输出：L3 产出替身。预期：语义核验只读 explanation 与载荷里的答案。"""
+
+        class _V:
+            stem = "「㐑」的读音是什么？"
+
+        _V.explanation = explanation
+        return _V()
+
+    def test_stated_answer_is_true(self) -> None:
+        """解析真的说出了标准答案 → true，并把解析实际说的那句带进理由。"""
+        stated, reason, error = explanation_states_answer(
+            self._client('{"states_answer": true, "stated": "xié", "reason": "解析说清了"}'),
+            self._spec(), self._verbalized(),
+        )
+        self.assertTrue(stated)
+        self.assertIn("xié", reason)
+        self.assertEqual(error, "")
+
+    def test_negated_answer_is_false(self) -> None:
+        """带着答案串却把答案说反了——子串比对会放过，语义核验必须拦下。"""
+        stated, _reason, error = explanation_states_answer(
+            self._client('{"states_answer": false, "stated": "不是 xié", "reason": "把答案说反了"}'),
+            self._spec(), self._verbalized("「㐑」的读音不是 xié。"),
+        )
+        self.assertFalse(stated)
+        self.assertEqual(error, "")
+
+    def test_broken_output_is_absent(self) -> None:
+        """输出不是合法 JSON → 缺席（None + 错误），调用方维持机械结论。"""
+        stated, _reason, error = explanation_states_answer(
+            self._client("这不是 JSON"), self._spec(), self._verbalized()
+        )
+        self.assertIsNone(stated)
+        self.assertTrue(error)
+
+    def test_payload_carries_no_internal_fields(self) -> None:
+        """载荷里只放解析与答案，不放 instruction / facts 这些内部字段。"""
+        messages = build_states_answer_messages(self._spec(), self._verbalized())
+        body = json.loads(messages[1]["content"])
+        self.assertEqual(set(body), {"explanation", "answer", "accepted"})
+
+
+class SubjectCorroborationTests(unittest.TestCase):
+    """输入：读者自报「缺条件」+ 机械闸门的旁证。输出：判定。
+
+    预期：「题干没说清问哪个字」这条否决要有**旁证**才算数——机械闸门确认题面里识别串一个
+          不缺（`subject_in_stem` / `options_listed` 都过）时，读者还自报缺条件就是误报
+          （实测 T13 反向题 / T8 约束题两条好题因此被丢进 rejects）。拿不到旁证（老记录）时
+          按老规矩否决——旁证只用来推翻误报，不用来放行。
+    """
+
+    @staticmethod
+    def _spec():
+        return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="㐑")
+
+    @staticmethod
+    def _client(text: str):
+        class _Client:
+            def complete(self, messages, *, temperature: float = 0.6, extra=None):
+                return Completion(ok=True, text=text, provider="p", model="m")
+        return _Client()
+
+    @staticmethod
+    def _verbalized():
+        class _V:
+            pass
+        _V.stem = "「㐑」是什么"
+        _V.explanation = "答案是「㐑」"
+        return _V()
+
+    def test_gates_confirm_identification_from_a_dict(self) -> None:
+        """落盘记录里的 `verification` 字典：两条闸门都过 = 有旁证。"""
+        self.assertTrue(subject_identified_by_gates({"subject_in_stem": True, "options_listed": True}))
+
+    def test_gates_report_a_failed_gate(self) -> None:
+        """任一条没过 = 没有旁证（题面确实缺东西）。"""
+        self.assertFalse(subject_identified_by_gates({"subject_in_stem": False, "options_listed": True}))
+
+    def test_gates_accept_a_verification_object(self) -> None:
+        """主流程传的是 `Verification` 对象、审计命令传的是字典——两条路径都要认。"""
+        self.assertTrue(subject_identified_by_gates(Verification(subject_in_stem=True, options_listed=True)))
+
+    def test_gates_return_none_without_the_fields(self) -> None:
+        """老记录缺字段 / 没给结论：返回 None，按老规矩否决。"""
+        self.assertIsNone(subject_identified_by_gates({}))
+        self.assertIsNone(subject_identified_by_gates(None))
+
+    def test_missing_condition_self_report_is_dropped_when_corroborated(self) -> None:
+        """有旁证 + 读者自报缺条件 → 不否决，并把「为什么没否决」留在 `answer_checked` 里。"""
+        client = self._client('{"answer": "缺条件"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized(), subject_identified=True)
+        self.assertTrue(result.ok)
+        self.assertIn("不予否决", result.answer_checked)
+
+    def test_missing_condition_self_report_vetoes_without_corroboration(self) -> None:
+        """没旁证（默认 None / 明确 False）→ 按老规矩否决，且不是「缺席」。"""
+        for flag in (None, False):
+            client = self._client('{"answer": "缺条件"}')
+            result = roundtrip_answer(client, self._spec(), self._verbalized(), subject_identified=flag)
+            self.assertFalse(result.ok, flag)
+            self.assertFalse(result.absent, flag)
+
+    def test_subject_false_report_is_dropped_when_corroborated(self) -> None:
+        """有旁证 + 读者自报「认不出是哪个字」→ 不否决，并把痕迹留在 `subject_checked` 里。"""
+        client = self._client('{"identifies_subject": false, "answer": "知识题"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized(), subject_identified=True)
+        self.assertTrue(result.ok)
+        self.assertIn("不予否决", result.subject_checked)
+        self.assertIn("subject_checked", result.as_dict())
+
+    def test_subject_false_report_vetoes_without_corroboration(self) -> None:
+        """没旁证时，读者的「认不出主语」照旧否决——旁证只用来推翻误报。"""
+        client = self._client('{"identifies_subject": false, "answer": "知识题"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.subject_checked, "")
 
 
 if __name__ == "__main__":

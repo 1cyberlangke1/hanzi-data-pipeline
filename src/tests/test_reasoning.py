@@ -127,7 +127,8 @@ class OddOneOutTests(unittest.TestCase):
         self.assertEqual(spec.answer, A.zi)
         self.assertEqual(len(spec.options), 4)
         self.assertIn(spec.answer, spec.options)
-        self.assertEqual(spec.facts["radical"], "\u5973")
+        # 键名自解释：这是**其它三个候选共有**的部首，答案字的部首与它不同
+        self.assertEqual(spec.facts["other_options_radical"], "\u5973")
         self.assertEqual(len(spec.distractors), 3)
 
     def test_stem_must_name_the_comparison_target(self) -> None:

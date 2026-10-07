@@ -203,7 +203,7 @@ def build_constraint(
     return TaskSpec(
         task_id="T8_constraint",
         instruction=(
-            "Ask the reader which character satisfies every condition listed in facts.conditions."
+            "Ask the reader which character satisfies every condition stated in the stem."
         ),
         facts={**facts, "conditions": description, "answer_zi": character.zi},
         answer=character.zi,
@@ -277,8 +277,8 @@ def build_component_chain(
     return TaskSpec(
         task_id="T9_component_chain",
         instruction=(
-            "Ask the reader which character is the innermost component reached by walking down the "
-            "position chain shown in the stem, starting from the given character."
+            f"Ask the reader which character sits at the innermost end of the position chain, "
+            f"starting from 「{character.zi}」."
         ),
         facts={"start_zi": character.zi, "path": path, "depth": difficulty.hops},
         answer=final.component,
@@ -340,7 +340,10 @@ def build_odd_one_out(
         instruction=(
             "Ask the reader which of the listed candidates has a radical different from the others."
         ),
-        facts={"radical": radical, "options": options, "answer_zi": character.zi},
+        # 键名必须自解释：`radical` 是**其它三个候选共有**的部首，答案字的部首与它不同。
+        # 旧键名 `radical` 有歧义，实测 2B 据此写出自相矛盾的解析
+        # （「「㐀」的部首是「子」，而其他三个字的部首也都是「子」，因此答案是「㐀」」）。
+        facts={"other_options_radical": radical, "options": options, "answer_zi": character.zi},
         answer=character.zi,
         options=tuple(options),
         # 「部首」是本题的**比较对象**：题干不写它，读者不知道该按什么挑（实测 16z 的产出
@@ -506,8 +509,8 @@ def build_ids_transform(
     return TaskSpec(
         task_id="T12_ids_transform",
         instruction=(
-            "Ask the reader which character results from applying the listed replacement steps, in "
-            "order, to the starting character."
+            f"Ask the reader which character results from applying the listed replacement steps, in "
+            f"order, to the starting character 「{character.zi}」."
         ),
         facts={
             "start_zi": character.zi,

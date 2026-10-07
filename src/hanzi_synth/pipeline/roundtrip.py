@@ -16,7 +16,7 @@ from typing import Any, Callable, Sequence
 
 from ..config import ProviderConfig, load_providers
 from ..llm.provider import ChatClient
-from ..llm.roundtrip import RoundTrip, roundtrip_answer
+from ..llm.roundtrip import RoundTrip, roundtrip_answer, subject_identified_by_gates
 from ..llm.verbalizer import Verbalized
 from .audit import collect_sources
 from .dedup import load_jsonl
@@ -48,7 +48,11 @@ def run_roundtrip(
 ) -> dict[str, Any]:
     """输入：输入路径 + 输出路径 + 上限 + 并发 + 种子。输出：统计字典。
 
-    预期：逐条把（题干, 解析, 选项）交给模型答题，答案对不上载荷里的定死答案就记一条失败。
+    预期：逐条把（题干, 选项）交给模型答题，答案对不上载荷里的定死答案就记一条失败。
+          比对**先规则后仲裁**：子串比对过了就过，对不上再让同一个模型判「是不是同一个答案」
+          （读者答出的是自然语言，只做子串比对会误杀「读作 xié」这种合法写法）。
+          「读者自报缺条件」还要过一道旁证：落盘记录里的 `subject_in_stem` / `options_listed`
+          两条闸门确认题面写全了识别条件时，按读者误报处理（`subject_identified_by_gates`）。
           载荷不全（老记录缺闸门字段）的条目**不猜**，单独计数并跳过——拿缺字段的记录复验
           只会静默降级，那比不查更坏。`--limit` 小于总条数时按种子抽样，可复现。
     """
@@ -81,7 +85,11 @@ def run_roundtrip(
         """输入：(来源文件名, 记录)。输出：一行逐条结果。预期：请求挂了也如实记账，不吞。"""
         source, record = item
         spec = spec_from_record(record)
-        result: RoundTrip = roundtrip_answer(client, spec, _verbalized_of(record), temperature=temperature)
+        result: RoundTrip = roundtrip_answer(
+            client, spec, _verbalized_of(record), temperature=temperature,
+            answer_judge=client,
+            subject_identified=subject_identified_by_gates(record.get("verification")),
+        )
         return {
             "task_id": spec.task_id,
             "ziid": str(record.get("ziid", "")),

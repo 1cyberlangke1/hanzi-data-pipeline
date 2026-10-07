@@ -63,14 +63,19 @@ class IdsForwardTests(unittest.TestCase):
         for step in spec.proof:
             self.assertNotIn("\u9898\u5e72", step)
 
-    def test_stem_must_ask_for_the_ids(self) -> None:
-        """题干问的必须是 IDS 拆写那件事：T3 漏过「问这个字一共有几画」这种换了问题的产出。"""
+    def test_stem_must_ask_for_the_component_structure(self) -> None:
+        """题干问的必须是「结构拆解」那件事：T3 漏过「问这个字一共有几画」这种换了问题的产出。
+
+        说明与闸门里都不出现 `IDS`：那是英文缩写，2B 会连英文夹注一起抄进中文题干
+        （实测产出「请说明字符㐀的 IDS（ideographic description sequence）分解方式」）。
+        闸门只认中文说法，说明也就用中文说法去描述要问什么。
+        """
         character = make_character()
         spec = build_ids_forward(character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character]))
         assert spec is not None
-        self.assertIn("IDS", spec.stem_asks_any)
         self.assertIn("拆解", spec.stem_asks_any)
-        self.assertIn("IDS", spec.instruction)
+        self.assertNotIn("IDS", spec.stem_asks_any)
+        self.assertNotIn("IDS", spec.instruction)
 
     def test_distractors_never_repeat_the_answer(self) -> None:
         """干扰项的 IDS 绝不能等于本字的任一候选（否则「其实也对」）。"""
@@ -127,8 +132,7 @@ class IdsReverseTests(unittest.TestCase):
         )
         assert spec is not None
         self.assertEqual(spec.structure_words, ("\u5de6\u4e0a\u5305\u56f4",))
-        # 问的必须是答案那件事：答案是 IDS 拆解，题干就得问拆解（实测漏网：「这个字是什么？」）
-        self.assertIn("IDS", spec.stem_asks_any)
+        # 问的必须是答案那件事：答案是结构拆解，题干就得问拆解（实测漏网：「这个字是什么？」）
         self.assertIn("\u62c6\u89e3", spec.stem_asks_any)
 
     def test_requires_own_words_and_forbids_cross_references(self) -> None:
@@ -288,7 +292,7 @@ class ReadingTests(unittest.TestCase):
         assert spec is not None
         self.assertEqual(
             spec.instruction,
-            "Ask the reader how the character shown in stem_must_contain is pronounced.",
+            "Ask the reader how the character \u300c\u597d\u300d is pronounced.",
         )
         self.assertNotIn("hao4", spec.instruction)
         self.assertIn("hao4", spec.accepted)

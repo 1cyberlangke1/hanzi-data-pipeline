@@ -100,8 +100,8 @@ def build_unicode_codepoint(
     return TaskSpec(
         task_id="T14_unicode_codepoint",
         instruction=(
-            "Ask the reader for the Unicode code point of the character shown in stem_must_contain, "
-            "in either the hexadecimal U+XXXX form or the equivalent decimal form."
+            f"Ask the reader for the Unicode code point of the character 「{character.zi}」, in "
+            f"either in hexadecimal or as the equivalent decimal number."
         ),
         facts={
             "zi": character.zi,
@@ -161,8 +161,7 @@ def build_unicode_bytes(
     return TaskSpec(
         task_id="T15_unicode_bytes",
         instruction=(
-            "Ask the reader for the hexadecimal UTF-8 byte sequence of the character shown in "
-            "stem_must_contain."
+            f"Ask the reader for the hexadecimal UTF-8 byte sequence of the character 「{character.zi}」."
         ),
         facts=facts,
         answer=answer,
@@ -206,8 +205,8 @@ def build_unicode_reverse(
     return TaskSpec(
         task_id="T16_unicode_reverse",
         instruction=(
-            "Ask the reader which of the listed candidates is the character whose code point is "
-            "given in facts.codepoint."
+            f"Ask the reader which of the listed candidates is the character whose code point is "
+            f"{shown}."
         ),
         facts={
             "codepoint": shown,

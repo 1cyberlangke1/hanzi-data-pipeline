@@ -17,6 +17,7 @@ api_key = "sk-secret"
 role = "verbalizer"
 rpm = 12
 batch = 2
+reasoning_effort = "none"
 
 [[providers]]
 name = "broken"
@@ -45,6 +46,9 @@ class LoadProvidersTests(unittest.TestCase):
         self.assertEqual(providers[0].rpm, 12)
         self.assertEqual(providers[0].batch, 2)
         self.assertEqual(providers[1].rpm, 0)
+        # 请求侧关思考开关是**配置**：配了就带出来，没配就是空串（请求体里不发这个字段）
+        self.assertEqual(providers[0].reasoning_effort, "none")
+        self.assertEqual(providers[1].reasoning_effort, "")
 
     def test_role_filter(self) -> None:
         """role 过滤只留下匹配的 provider。"""

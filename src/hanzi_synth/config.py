@@ -30,6 +30,11 @@ class ProviderConfig:
     role: str = "verbalizer"
     rpm: int = 0  # 0 = 不限速（仅用于本地 mock）
     batch: int = 1
+    # 关思考的**请求侧**开关（空串 = 请求体里不发这个字段）。
+    # 云端网关会忽略它（thinking.py 里记过实测），但本地 LM Studio 认 `reasoning_effort = "none"`：
+    # 实测同一份往返检验请求，不发时 325 秒且正文为空（思考段把额度烧光），发了 0.6 秒且判定完整。
+    # 它是**配置不是常量**——换端点就改 secrets.toml，不写死在代码里。
+    reasoning_effort: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -72,6 +77,7 @@ def load_providers(path: Path | str = DEFAULT_SECRETS, role: str | None = None) 
                 role=str(block.get("role", "verbalizer")),
                 rpm=int(block.get("rpm", 0) or 0),
                 batch=max(1, int(block.get("batch", 1) or 1)),
+                reasoning_effort=str(block.get("reasoning_effort", "") or ""),
             )
         )
     if role is not None:

@@ -132,13 +132,19 @@ class ChatClient:
         extra: Mapping[str, Any] | None,
     ) -> requests.Response:
         """输入：provider 与请求内容。输出：HTTP 响应。
-        预期：请求体**不含 max_tokens**；api_key 只出现在请求头，不进日志。
+        预期：请求体**不含 max_tokens**；api_key 只出现在请求头，不进日志；
+              provider 配了 `reasoning_effort` 才发这个字段（空串不发，不认它的端点不会 400）。
         """
         payload: dict[str, Any] = {
             "model": provider.model,
             "messages": list(messages),
             "temperature": temperature,
         }
+        if provider.reasoning_effort:
+            # 关思考的请求侧开关。本项目产出**一律丢弃思考段**（thinking.py），而 2B 在判定类
+            # 任务上会把整份额度烧进思考段（实测往返检验 325 秒、finish_reason=length、正文为空），
+            # 所以由 provider 配置显式关掉——这是机制开关，不是对模型措辞的规定。
+            payload["reasoning_effort"] = provider.reasoning_effort
         if extra:
             payload.update(extra)
         return requests.post(

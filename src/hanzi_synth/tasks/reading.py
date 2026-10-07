@@ -108,7 +108,7 @@ def build_reading(
     return TaskSpec(
         task_id="T4_reading",
         instruction=(
-            "Ask the reader how the character shown in stem_must_contain is pronounced."
+            f"Ask the reader how the character 「{character.zi}」 is pronounced."
         ),
         facts={"zi": character.zi, "reading": answer, "reading_display": shown, "radical": character.radical},
         # 题干闸门：答案是**读音**，题干必须问读音（同 T1 的理由——闸门空着等于不设防）

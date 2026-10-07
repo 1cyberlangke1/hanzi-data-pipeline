@@ -62,8 +62,7 @@ def build_standard_form(
     return TaskSpec(
         task_id="T5_standard_form",
         instruction=(
-            "Ask the reader which character is the standard form of the character shown in "
-            "stem_must_contain."
+            f"Ask the reader which character is the standard form of 「{character.zi}」."
         ),
         facts={
             "zi": character.zi,
@@ -104,7 +103,7 @@ def build_variant(
     return TaskSpec(
         task_id="T5_variant",
         instruction=(
-            "Ask the reader for one variant form of the character shown in stem_must_contain."
+            f"Ask the reader which character is a variant form of 「{character.zi}」."
         ),
         facts={
             "zi": character.zi,
@@ -147,8 +146,8 @@ def build_reference(
     return TaskSpec(
         task_id="T6_zh_ref",
         instruction=(
-            f"Ask the reader on which page of the dictionary 《{_ZH_DICT}》 the character shown in "
-            "stem_must_contain is listed."
+            f"Ask the reader on which page of the dictionary 《{_ZH_DICT}》 the character "
+            f"「{character.zi}」 is listed."
         ),
         facts={
             "zi": character.zi,
@@ -193,8 +192,8 @@ def build_meaning_source(
     return TaskSpec(
         task_id="T7_meaning_source",
         instruction=(
-            "Ask the reader which of the listed candidate dictionaries contains the definition of "
-            "the character shown in stem_must_contain."
+            f"Ask the reader which of the listed candidate dictionaries contains the definition of "
+            f"「{character.zi}」."
         ),
         facts={"zi": character.zi, "source": answer, "options": list(_MEANING_SOURCES.values())},
         answer=answer,

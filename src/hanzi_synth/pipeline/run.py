@@ -45,7 +45,7 @@ from ..llm.provider import ChatClient
 from ..llm.verbalizer import Verbalized, verbalize, verbalize_batch
 from ..tasks.base import Difficulty, Distractor, TaskSpec
 from ..tasks.registry import CONSTRUCTORS, TASK_STEM_ASKS, build_all
-from ..llm.roundtrip import roundtrip_answer
+from ..llm.roundtrip import explanation_states_answer, roundtrip_answer, subject_identified_by_gates
 from ..verify.checks import JUDGE_FEEDBACK_KEY, ROUNDTRIP_FEEDBACK_KEY, verify
 from .dedup import load_jsonl
 from .difficulty import difficulty_note
@@ -290,6 +290,56 @@ def _publishable(verification: Any, judgement: Any, roundtrip: Any = None) -> bo
     return _round_passed(verification.tier, judgement, roundtrip)
 
 
+def _roundtrip_reason(roundtrip: Any) -> str:
+    """输入：落盘的读者检验结果（dict）。输出：一条**中文**失败原因（进 rejects / attempt-stats）。
+
+    预期：把「读者到底读出了什么」写清楚——只记一句「往返检验否决」的话，rejects 里看不出
+          这道题是被四条判据里的哪一条拦下的。给措辞模型的那一份是英文（见 `_roundtrip_feedback`）。
+    """
+    note = str(roundtrip.get("note") or "")
+    if roundtrip.get("is_question") is False:
+        return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干没有向读者提问（{note or '读者读不出作答要求'}）"
+    if roundtrip.get("identifies_subject") is False:
+        return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干没说清问的是哪个字（{note or '读者认不出题目针对哪个字'}）"
+    phrases = roundtrip.get("writer_phrases") or []
+    if phrases:
+        return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干里夹着写给写题人的话 {list(phrases)}"
+    answer = str(roundtrip.get("answer") or "（答不出）")
+    return f"{ROUNDTRIP_FEEDBACK_KEY}: 只凭题干答出的是「{answer}」，与标准答案不符"
+
+
+def _roundtrip_feedback(spec: TaskSpec, roundtrip: Any) -> str:
+    """输入：TaskSpec + 这一轮的读者检验结论（RoundTrip）。输出：回灌给措辞模型的反馈。
+
+    预期：**英文**——「程序侧文本一律英文」是既有的机制（见 verbalizer 模块注释），模型就抄不进
+          中文题干；实测中文反馈会被 2B 整段当成题干输出（「题干里夹着写给写作者的要求（…）」
+          原样进了 stem）。给人看的中文原因在 `_roundtrip_reason`，两份用途不同、各写各的。
+    """
+    if not roundtrip.is_question:
+        return (
+            f"{ROUNDTRIP_FEEDBACK_KEY}: a reader found no question in the stem "
+            f"({roundtrip.note or 'no answer request is readable'}). The stem must ask the reader "
+            "something — write it as a question with a clear answer request, not as a statement "
+            "and not as a restatement of an instruction."
+        )
+    if not roundtrip.identifies_subject:
+        return (
+            f"{ROUNDTRIP_FEEDBACK_KEY}: a reader could not tell which character the stem is about "
+            f"({roundtrip.note or 'the character never appears in the stem'}). Write the character "
+            "itself (or the whole candidate list) into the stem."
+        )
+    if roundtrip.writer_phrases:
+        return (
+            f"{ROUNDTRIP_FEEDBACK_KEY}: the stem contains sentences addressed to the writer "
+            f"{list(roundtrip.writer_phrases)}. Delete them — the stem must contain the question only."
+        )
+    return (
+        f"{ROUNDTRIP_FEEDBACK_KEY}: reading only the stem, a reader answered "
+        f"{roundtrip.answer or 'nothing'} while the intended answer is {spec.answer!r}. "
+        "Make the stem give the reader enough to reach that answer."
+    )
+
+
 def _round_reasons(tier: Any, failures: Any, judgement: Any, roundtrip: Any = None) -> list[str]:
     """输入：程序防线 tier + 该轮的 failures + 裁判判定。输出：该轮的失败原因列表。
     预期：程序防线有自己的 failures 就用它；「程序全过但裁判否决」时 failures 是空的，
@@ -298,26 +348,81 @@ def _round_reasons(tier: Any, failures: Any, judgement: Any, roundtrip: Any = No
     """
     reasons = list(failures or [])
     if not reasons and tier == "A" and _roundtrip_vetoed(roundtrip):
-        answer = str((roundtrip or {}).get("answer") or "（答不出）")
-        note = str((roundtrip or {}).get("note") or "")
-        if (roundtrip or {}).get("is_question") is False:
-            reasons.append(f"{ROUNDTRIP_FEEDBACK_KEY}: 题干不是在向读者提问（{note or '读者读不出作答要求'}）")
-        elif (roundtrip or {}).get("asks_reader_only") is False:
-            reasons.append(
-                f"{ROUNDTRIP_FEEDBACK_KEY}: 题干里夹着写给写作者的要求"
-                f"（{note or '读者读到了不该出现在题目里的要求'}）"
-            )
-        else:
-            reasons.append(f"{ROUNDTRIP_FEEDBACK_KEY}: 只凭题干答出的是「{answer}」，与标准答案不符")
+        reasons.append(_roundtrip_reason(roundtrip or {}))
     if not reasons and tier == "A" and _judge_vetoed(judgement):
         reason = str((judgement or {}).get("reason") or "未给理由")
         reasons.append(f"{JUDGE_FEEDBACK_KEY}: {reason}")
     return reasons
 
 
+def _better_round(history: list[dict], best: int, index: int) -> int:
+    """输入：逐轮判定记录 + 当前最好一轮的下标 + 新一轮的下标。输出：新的最好轮下标。
+
+    预期：只比**判定**，不比文本——tier A 优先，其次「往返检验 / 裁判没有否决」，最后 failures
+          少的优先；并列保留**更早**的一轮（先到的更稳）。重试用尽时返回这一轮，否则第二轮退化
+          （实测 T10 / T5_variant 第二轮整段回显载荷或输出散文）会把第一轮的合格产出顶掉。
+    """
+    def score(at: int) -> tuple[int, int, int]:
+        row = history[at]
+        vetoed = _roundtrip_vetoed(row.get("roundtrip")) or _judge_vetoed(row.get("judge"))
+        return (
+            1 if row.get("tier") == "A" else 0,
+            0 if vetoed else 1,
+            -len(list(row.get("failures") or [])),
+        )
+
+    return index if score(index) > score(best) else best
+
+
+def _chosen_row(history: list[dict]) -> dict:
+    """输入：逐轮判定记录。输出：**被选中那一轮**的记录（空 history 返回空字典）。
+
+    预期：`_verbalize_with_retries` 在重试用尽时返回最好的一轮，并在那一轮打上 `chosen`；
+          发布判据必须取那一轮，不能取 `history[-1]`——否则「最后一轮退化」会把好轮次的判定
+          记到数据上。没打标记时退回最后一行（兼容旧记录与手工构造的 history）。
+    """
+    for row in reversed(history):
+        if row.get("chosen"):
+            return row
+    return history[-1] if history else {}
+
+
+def _verified_with_semantic_answer(
+    verdict: Any, spec: TaskSpec, verbalized: Verbalized, answer_judge: ChatClient | None,
+) -> Any:
+    """输入：机械闸门结论 + TaskSpec + L3 产出 + 答案仲裁客户端。输出：可能被修正过的 Verification。
+
+    预期：`answer_in_explanation` 是**子串比对**——它判得了「解析里有没有那串字」，判不了「解析说的
+          是不是那个答案」（「这个字的读音不是 xié」「除了 qiu1 之外都对」都带着答案串，却把答案
+          说反了）。所以它只做**快速通过**：过了不花配额；没过才让 LLM 读一遍解析，判「解析陈述出来
+          的答案是不是标准答案」，判过就把那条失败撤掉（痕迹留在 `semantic_answer`）。
+          仲裁缺席（跑挂了 / 输出不合法）维持机械结论——工具问题不判数据死刑，也不放行。
+          failures 与 notes 是同一批失败的两份说法，撤一条要两边一起撤。
+    """
+    if verdict.answer_in_explanation or answer_judge is None:
+        return verdict
+    if any(not item.startswith("answer_in_explanation") for item in verdict.failures):
+        # 别的闸门也挂了：这一条救回来照样发布不了，不花这次配额。
+        return verdict
+    stated, reason, error = explanation_states_answer(answer_judge, spec, verbalized)
+    if stated is None:
+        return replace(verdict, semantic_answer=f"仲裁缺席（{error}）")
+    if not stated:
+        return replace(verdict, semantic_answer=f"LLM 仲裁：{reason or '解析没说清答案'}")
+    answer_note = f"The explanation never states the answer {spec.answer!r}. Write it in."
+    return replace(
+        verdict,
+        answer_in_explanation=True,
+        semantic_answer=f"LLM 仲裁：{reason or '解析说的就是标准答案'}",
+        failures=tuple(item for item in verdict.failures if not item.startswith("answer_in_explanation")),
+        notes=tuple(item for item in verdict.notes if item != answer_note),
+    )
+
+
 def _verbalize_with_retries(
     client: ChatClient, spec: TaskSpec, *, retries: int, temperature: float,
     avoid: Sequence[str] = (), judge_client: ChatClient | None = None, do_roundtrip: bool = False,
+    answer_judge: ChatClient | None = None,
 ) -> tuple[Verbalized, Any, int, list[dict]]:
     """输入：客户端 + TaskSpec + 重试次数 + 温度 + 已用过的开头 + 可选的裁判客户端。
     输出：(L3 产出, L4 结论, 实际尝试次数, 逐轮判定记录)。
@@ -333,13 +438,17 @@ def _verbalize_with_retries(
           裁判缺席（自己跑挂了）不算否决；裁判否决则把它的理由回灌给下一轮。
           注意：裁判否决**不改** `verification.tier`（那是程序防线的结论），发布与否统一由
           `_publishable` 判——否则「程序全过 + 裁判否决」会被当成 tier A 发出去。
+          `answer_judge` 是**答案仲裁**客户端，与裁判是两件事：往返检验里读者答出的是一句自然
+          语言，子串比对只是快速通道，对不上时用它判「是不是同一个答案」（传 None 就只有快速通道）。
     """
     feedback: tuple[str, ...] = ()
-    result: tuple[Verbalized, Any] | None = None
+    results: list[tuple[Verbalized, Any]] = []
     history: list[dict] = []
+    best = 0
     for round_no in range(retries + 1):
         verbalized = verbalize(client, spec, temperature=temperature, feedback=feedback, avoid=avoid)
-        verdict = verify(spec, verbalized)
+        # 机械闸门 + 解析的**语义核验**：`answer_in_explanation` 是子串比对，过不了才问 LLM。
+        verdict = _verified_with_semantic_answer(verify(spec, verbalized), spec, verbalized, answer_judge)
         judgement = None
         if judge_client is not None and verdict.tier == "A":
             judgement = judge_record(judge_client, spec, verbalized)
@@ -348,55 +457,44 @@ def _verbalize_with_retries(
         # 那正是枚举措辞形状永远追不完的那件事。
         roundtrip = None
         if do_roundtrip and verdict.tier == "A":
-            roundtrip = roundtrip_answer(client, spec, verbalized)
-        result = (verbalized, verdict)
+            roundtrip = roundtrip_answer(
+                client, spec, verbalized, answer_judge=answer_judge,
+                subject_identified=subject_identified_by_gates(verdict),
+            )
+        judge_dict = judgement.as_dict() if judgement is not None else None
+        roundtrip_dict = roundtrip.as_dict() if roundtrip is not None else None
+        results.append((verbalized, verdict))
         history.append(
             {
                 "round": round_no + 1,
                 "tier": verdict.tier,
                 "failures": list(verdict.failures),
                 "error": verbalized.error or "",
-                "judge": judgement.as_dict() if judgement is not None else None,
-                "roundtrip": roundtrip.as_dict() if roundtrip is not None else None,
+                "judge": judge_dict,
+                "roundtrip": roundtrip_dict,
             }
         )
-        if _round_passed(
-            verdict.tier,
-            judgement.as_dict() if judgement is not None else None,
-            roundtrip.as_dict() if roundtrip is not None else None,
-        ):
-            return result[0], result[1], round_no + 1, history
+        best = _better_round(history, best, round_no)
+        if _round_passed(verdict.tier, judge_dict, roundtrip_dict):
+            history[round_no]["chosen"] = True
+            return verbalized, verdict, round_no + 1, history
         if verdict.failures:
-            feedback = tuple(verdict.failures)
-        elif _roundtrip_vetoed(roundtrip.as_dict() if roundtrip is not None else None):
-            if not roundtrip.is_question:
-                feedback = (
-                    f"{ROUNDTRIP_FEEDBACK_KEY}：题干没有向读者提问（{roundtrip.note or '读者读不出作答要求'}）。"
-                    "题干必须是一道题——提出明确的作答要求，不要把写作要求或出题说明复述一遍。",
-                )
-            elif not roundtrip.asks_reader_only:
-                feedback = (
-                    f"{ROUNDTRIP_FEEDBACK_KEY}：题干里夹着写给写作者的要求"
-                    f"（{roundtrip.note or '读者读到了不该出现在题目里的要求'}）。"
-                    "题干里只留题目本身：把「请列出所有候选」「不要出现数字」「请用自己的话解释」"
-                    "这类要求整句删掉；该出现的内容（候选、读音、条件）要自然地写进句子里。",
-                )
-            else:
-                feedback = (
-                    f"{ROUNDTRIP_FEEDBACK_KEY}：读者只凭题干答出的是「{roundtrip.answer or '答不出'}」，"
-                    f"而标准答案是「{spec.answer}」——请让题干自己给出足够的识别条件，读者照着它就能答对。",
-                )
+            # 回灌**英文**说法：中文失败原因会被 2B 整段抄进题干（实测「题干列出了…」
+            # 「请在提供的汉字中找出…」都是上一轮中文反馈的回声）。中文那份仍在 rejects 里。
+            feedback = tuple(verdict.notes) or tuple(verdict.failures)
+        elif _roundtrip_vetoed(roundtrip_dict):
+            feedback = (_roundtrip_feedback(spec, roundtrip),)
         elif judgement is not None:
             feedback = (f"{JUDGE_FEEDBACK_KEY}：{judgement.reason or '未给理由'}",)
         else:
             feedback = ()
-    assert result is not None
-    return result[0], result[1], retries + 1, history
+    history[best]["chosen"] = True
+    return results[best][0], results[best][1], retries + 1, history
 
 
 def _verbalize_batch_with_retries(
     client: ChatClient, specs: Sequence[TaskSpec], *, retries: int, temperature: float,
-    do_roundtrip: bool = False,
+    do_roundtrip: bool = False, answer_judge: ChatClient | None = None,
     ) -> list[tuple[Verbalized, Any, int, list[dict]]]:
     """输入：客户端 + 一批 TaskSpec + 重试次数 + 温度 + 要不要跑往返检验。
     输出：与 `specs` 等长、顺序一致的 (L3 产出, L4 结论, 实际轮数, 逐轮判定记录) 列表。
@@ -407,10 +505,13 @@ def _verbalize_batch_with_retries(
           往返检验也在这里接上：**批量省的是措辞请求，省不掉这道检验**——它按题独立
           （每道题要各自被读一次，合不进一次批量请求），所以是每道过了程序防线的题
           各花一次请求。少接这一条的话，`batch > 1` 就成了「往返检验静默失效」的旁路。
+          `answer_judge` 与单题路径同一件事：读者答出的自然语言与定死答案对不上时，
+          交给 LLM 判「是不是同一个答案」；`subject_identified` 旁证同样在这里接上。
     """
     rounds = [0] * len(specs)
-    results: list[tuple[Verbalized, Any] | None] = [None] * len(specs)
+    results: list[list[tuple[Verbalized, Any]]] = [[] for _ in specs]
     histories: list[list[dict]] = [[] for _ in specs]
+    best = [0] * len(specs)
     pending = list(range(len(specs)))
     feedback: dict[str, Sequence[str]] = {}
     for round_no in range(retries + 1):
@@ -424,15 +525,18 @@ def _verbalize_batch_with_retries(
         feedback = {}
         for position, index in enumerate(pending):
             item = verbalized[position]
-            verdict = verify(specs[index], item)
+            verdict = _verified_with_semantic_answer(verify(specs[index], item), specs[index], item, answer_judge)
             roundtrip = (
-                roundtrip_answer(client, specs[index], item)
+                roundtrip_answer(
+                    client, specs[index], item, answer_judge=answer_judge,
+                    subject_identified=subject_identified_by_gates(verdict),
+                )
                 if do_roundtrip and verdict.tier == "A"
                 else None
             )
             roundtrip_dict = roundtrip.as_dict() if roundtrip is not None else None
             rounds[index] = round_no + 1
-            results[index] = (item, verdict)
+            results[index].append((item, verdict))
             histories[index].append(
                 {
                     "round": round_no + 1,
@@ -442,17 +546,20 @@ def _verbalize_batch_with_retries(
                     "roundtrip": roundtrip_dict,
                 }
             )
+            best[index] = _better_round(histories[index], best[index], len(histories[index]) - 1)
             if not _round_passed(verdict.tier, None, roundtrip_dict):
                 next_pending.append(index)
                 feedback[f"第 {index + 1} 题（{specs[index].task_id}）"] = tuple(
-                    _round_reasons(verdict.tier, verdict.failures, None, roundtrip_dict)
+                    verdict.notes or _round_reasons(verdict.tier, verdict.failures, None, roundtrip_dict)
                 )
         pending = next_pending
 
     out: list[tuple[Verbalized, Any, int, list[dict]]] = []
-    for index, entry in enumerate(results):
-        if entry is None:  # 只可能在 specs 为空时发生，真出现就当场炸，不静默补空
+    for index, entries in enumerate(results):
+        if not entries:  # 只可能在 specs 为空时发生，真出现就当场炸，不静默补空
             raise RuntimeError(f"批量措辞没有覆盖第 {index + 1} 题")
+        histories[index][best[index]]["chosen"] = True
+        entry = entries[best[index]]
         out.append((entry[0], entry[1], rounds[index], histories[index]))
     return out
 
@@ -767,6 +874,7 @@ def run_pipeline(
     *,
     client: ChatClient | None = None,
     judge_client: ChatClient | None = None,
+    answer_judge_client: ChatClient | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
     """输入：PipelineConfig（可注入 client 便于测试）+ 进度回调。输出：运行统计 dict。
@@ -774,6 +882,9 @@ def run_pipeline(
           `resume=True` 时**追加写且跳过已有主键**，绝不截断既有产物。
           `config.judge=True` 时启用 L4.5 LLM 裁判；`judge_client` 可注入（测试用），
           不注入就优先用 secrets.toml 里 role="judge" 的 provider，没有则复用措辞 provider。
+          `answer_judge_client` 是**答案仲裁**客户端（测试用注入）：它与裁判不是一回事，
+          非 offline 一律接上——两处比对都靠它：① 解析里说的是不是定死的答案；② 读者答出的
+          自然语言与定死的答案是不是同一个。子串比对只是快速通道，判定权在它。
     """
     say = progress or (lambda _msg: None)
     rng = random.Random(config.seed)
@@ -863,6 +974,14 @@ def run_pipeline(
             judge_client = client
             say('裁判复用措辞 provider（secrets.toml 里没配 role="judge" 的块）')
 
+    # 答案仲裁客户端：**不受 `--judge` 开关控制**——两处比对都是「快速通过 → LLM 判定」：
+    # ① 解析里说的是不是定死的答案（`answer_in_explanation` 是子串比对，过不了才问）；
+    # ② 读者答出的自然语言与定死的答案是不是同一个（「读作 xié」与 `xie2`）。
+    # 规则仍是快速通道：子串比对过了就不发这次请求，所以常态下不额外花配额。
+    answer_judge = None
+    if not config.offline:
+        answer_judge = answer_judge_client or client
+
     # 批量大小：CLI 显式给了就用它，否则跟随 provider 配置（secrets.toml 的 `batch`）。
     # 这样 secrets.toml 里的 `batch` 不再是没人读的死配置，而调大它必须过 A/B 质量对比。
     batch_size = config.batch if config.batch > 0 else max(1, active_providers[0].batch if active_providers else 1)
@@ -916,8 +1035,9 @@ def run_pipeline(
                   无论最终过没过，每一轮判定都先追加进 `<out>.attempts.jsonl`——这样「首轮被拒的原因」
                   与「被救回的题首轮错在哪」都留得下，不再只剩一个 retried 计数。
             """
-            judgement = history[-1].get("judge") if history else None
-            roundtrip = history[-1].get("roundtrip") if history else None
+            chosen = _chosen_row(history)
+            judgement = chosen.get("judge")
+            roundtrip = chosen.get("roundtrip")
             published = _publishable(verification, judgement, roundtrip)
             for row in history:
                 attempt_handle.write(
@@ -993,6 +1113,7 @@ def run_pipeline(
                     client, spec, retries=config.retries, temperature=config.temperature,
                     avoid=avoid_for(spec),
                     judge_client=judge_client, do_roundtrip=config.roundtrip,
+                    answer_judge=answer_judge,
                 )
 
             def record(no: int, character: Any, spec: TaskSpec, verbalized: Verbalized,
@@ -1048,7 +1169,7 @@ def run_pipeline(
                 return _verbalize_batch_with_retries(
                     client, [spec for _no, _character, spec in unit],
                     retries=config.retries, temperature=config.temperature,
-                    do_roundtrip=config.roundtrip,
+                    do_roundtrip=config.roundtrip, answer_judge=answer_judge,
                 )
 
             if batch_size <= 1:
@@ -1127,6 +1248,7 @@ def replay_rejects(
     *,
     client: ChatClient | None = None,
     judge_client: ChatClient | None = None,
+    answer_judge_client: ChatClient | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
     """输入：配置（决定产出路径 / 重试次数 / 温度 / 并发）+ rejects 文件 + 可注入 client + 进度回调。
@@ -1140,6 +1262,8 @@ def replay_rejects(
           - 仍失败的写回炉产物文件（文件名里只保留**一层** `.replayed.jsonl`，不再层层嵌套）；
             原 rejects 文件一个字节不动——除非输入本身就是回炉产物，此时就地更新；
           - `config.judge=True` 时同样过 L4.5 裁判，规则与主流程完全一致（`judge_client` 可注入）。
+          - 答案仲裁同样接上（`answer_judge_client` 可注入）：回炉与主流程共用 `verify` 与
+            `roundtrip_answer`，两条路径的判据不能有两套口径。
     """
     say = progress or (lambda _msg: None)
     if config.offline:
@@ -1207,6 +1331,9 @@ def replay_rejects(
             judge_client = client
             say('裁判复用措辞 provider（secrets.toml 里没配 role="judge" 的块）')
 
+    # 答案仲裁客户端：回炉与主流程同一套判据（回炉恒为非 offline，见上面的 ConfigError）。
+    answer_judge = answer_judge_client or client
+
     started_at = time.perf_counter()
     with OutputLock(out_path):
         mode = "a" if out_path.exists() else "w"
@@ -1224,8 +1351,9 @@ def replay_rejects(
                 预期：每轮判定先追加进 attempts 日志——回炉救回的题也要留下首轮错在哪。
                 """
                 ziid = str(spec.provenance.get("seed_ziid", ""))
-                judgement = history[-1].get("judge") if history else None
-                roundtrip = history[-1].get("roundtrip") if history else None
+                chosen = _chosen_row(history)
+                judgement = chosen.get("judge")
+                roundtrip = chosen.get("roundtrip")
                 published = _publishable(verification, judgement, roundtrip)
                 for row in history:
                     attempt_handle.write(
@@ -1274,6 +1402,7 @@ def replay_rejects(
                     verbalized, verification, rounds, history = _verbalize_with_retries(
                         client, spec, retries=config.retries, temperature=config.temperature,
                         judge_client=judge_client, do_roundtrip=config.roundtrip,
+                        answer_judge=answer_judge,
                     )
                     stats["retried"] += 1 if rounds > 1 else 0
                     published = handle_one(no, spec, verbalized, verification, history)
@@ -1292,6 +1421,7 @@ def replay_rejects(
                                 temperature=config.temperature,
                                 judge_client=judge_client,
                                 do_roundtrip=config.roundtrip,
+                                answer_judge=answer_judge,
                             )
                             for no, spec in chunk
                         ]
