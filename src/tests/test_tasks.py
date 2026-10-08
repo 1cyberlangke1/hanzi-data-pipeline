@@ -5,11 +5,21 @@ from __future__ import annotations
 import random
 import unittest
 
-from hanzi_synth.tasks.base import DISTRACTOR_DEPTHS, MIXED_DEPTH, Difficulty, resolve_depth
+from hanzi_synth.facts.gloss import gloss_phrase
+from hanzi_synth.facts.surface import reading_surfaces
+from hanzi_synth.tasks.base import (
+    DISTRACTOR_DEPTHS,
+    MIXED_DEPTH,
+    MIXED_LEVEL,
+    Difficulty,
+    resolve_constraints,
+    resolve_depth,
+    resolve_hops,
+)
 from hanzi_synth.tasks.glyph import build_ids_forward, build_ids_reverse, build_stroke_total
 from hanzi_synth.tasks.reading import build_reading, canonical_reading, extract_readings
 from hanzi_synth.tasks.registry import CONSTRUCTORS, TASK_STEM_ASKS, build_all
-from tests.support import make_character, make_index
+from tests.support import full_coverage_pool, make_character, make_index
 
 
 class StrokeTotalTests(unittest.TestCase):
@@ -96,11 +106,28 @@ class IdsReverseTests(unittest.TestCase):
 
     def test_carries_meaning_source_for_restating(self) -> None:
         """有释义时把原文交给 L3 去重述，答案仍是 IDS 候选集合。"""
-        character = make_character(meanings={"mean_h": ["\u6307\u4e8b\u7269\u4ee4\u4eba\u6ee1\u610f\u3002"]})
+        character = make_character(meanings={"mean_h": ["\u62fc\u97f3hao3<br>\u6307\u4e8b\u7269\u4ee4\u4eba\u6ee1\u610f\u3002"]})
         spec = build_ids_reverse(character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character]))
         assert spec is not None
         self.assertIn("meaning_source", spec.facts)
         self.assertEqual(spec.answer, "\u2ff0\u5973\u5b50")
+
+    def test_shared_identification_conditions_are_not_asked(self) -> None:
+        """识别条件（读音 + 释义）在池里不唯一时**不出反向题**：同一个题干会有多个都算对的答案
+        （实测全池 6619/17798 个字命中，「女子人名用字」这种通用释义被好几个字共享）。
+        """
+        meaning = "\u62fc\u97f3xi1<br>\u5973\u5b50\u4eba\u540d\u7528\u5b57\u3002"
+        first = make_character(
+            zi="\u597d", ziid="U0597D", ids=("\u2ff0\u5973\u5e0c",), meanings={"mean_h": [meaning]}
+        )
+        second = make_character(
+            zi="\u5982", ziid="U05982", ids=("\u2ff0\u5973\u6614",), meanings={"mean_h": [meaning]}
+        )
+        index = make_index([first, second])
+        for character in (first, second):
+            self.assertIsNone(
+                build_ids_reverse(character, rng=random.Random(1), difficulty=Difficulty(), index=index)
+            )
 
     def test_carries_reading_and_requires_it_in_the_stem(self) -> None:
         """释义里带读音标注时，读音必须进 facts 并被写进要求——反向题不写那个字，
@@ -113,11 +140,13 @@ class IdsReverseTests(unittest.TestCase):
             character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
         )
         assert spec is not None
-        self.assertEqual(spec.facts["reading"], ("hao3",))
-        self.assertTrue(spec.facts["reading_display"])
-        # 识别条件是**程序侧闸门**（`must_contain`），不是散文要求：写进要求里模型照样漏。
+        # facts 只给**展示写法**（带调符号）：给了 ascii 那份 2B 会挑它抄。
+        self.assertEqual(spec.facts["reading_display"], ["hǎo"])
+        # 识别条件是**程序侧闸门**（`must_contain`），不是散文要求：只写「靠读音认出」模型照样漏。
         self.assertEqual(spec.must_contain, tuple(spec.facts["reading_display"]))
-        self.assertIn("reading", spec.instruction)
+        # 说明里必须**带上读音本身**：真机 2/18 栽在「题干没写读音」，而只写「靠读音认出」时
+        # 模型不写具体读音；写进说明后读音 3/3、释义 3/3（probe_t13.jsonl）。
+        self.assertIn("hǎo", spec.instruction)
 
     def test_declares_structure_words_and_forbids_them_in_stem(self) -> None:
         """T13 必须声明答案真实用到的位置词，并要求题干里一个都不出现——实测 2B 用
@@ -152,18 +181,20 @@ class IdsReverseTests(unittest.TestCase):
         self.assertEqual(spec.hidden_subject, character.zi)
         self.assertNotIn("\u540c\u3010", spec.instruction)
 
-    def test_without_reading_still_builds(self) -> None:
-        """释义里抽不出读音时不砍这批字：只是不加「必须写读音」那条要求。
+    def test_without_reading_is_skipped(self) -> None:
+        """释义里抽不出读音时不出反向题：题干一个识别条件都没有，读者谁也答不了。
+
+        抽不出读音有两种：释义里压根没有读音标注；标注不是「拼音xxx」格式（朝鲜吏读那类
+        「读音gul」）。两种都不硬造题——这道题靠「读音 + 释义」认出是哪个字。
         """
-        character = make_character(meanings={"mean_h": ["指事物令人满意。"]})
-        spec = build_ids_reverse(
-            character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
-        )
-        assert spec is not None
-        self.assertEqual(spec.facts["reading"], ())
-        # 抽不出读音就不加这条必现串——不能拿「读音」两个字当代理：隐藏主语那一条本来
-        # 就该提读音，用代理会把好数据判死
-        self.assertEqual(spec.must_contain, ())
+        for meaning in ("指事物令人满意。", "读音gul。音译字。古文書所見奴婢名也。"):
+            character = make_character(meanings={"mean_h": [meaning]})
+            self.assertIsNone(
+                build_ids_reverse(
+                    character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
+                ),
+                meaning,
+            )
 
     def test_cross_references_are_stripped_before_wording(self) -> None:
         """释义里的互见条目必须在构造时删掉：它会把答案那个字直接写出来
@@ -185,7 +216,7 @@ class IdsReverseTests(unittest.TestCase):
         self.assertNotIn("同【", source)
         self.assertNotIn("隐", source)
         self.assertIn("归", source)
-        self.assertEqual(spec.facts["reading"], ("yi1", "yin3"))
+        self.assertEqual(spec.facts["reading_display"], ["yī", "yǐn"])
 
     def test_short_meaning_is_skipped(self) -> None:
         """释义太短（<6 字）没材料可重述，直接不出。"""
@@ -203,17 +234,7 @@ class IdsReverseTests(unittest.TestCase):
             character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
         )
         assert spec is not None
-        self.assertEqual(spec.must_contain, ("hao3",))
-
-    def test_without_reading_has_no_must_contain(self) -> None:
-        """抽不出读音时（朝鲜吏读那类注音）不强求：`must_contain` 为空，不能因此砍掉整批字。"""
-        character = make_character(meanings={"mean_h": ["读音gul。音译字。古文書所見奴婢名也。"]})
-        spec = build_ids_reverse(
-            character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
-        )
-        assert spec is not None
-        self.assertEqual(spec.must_contain, ())
-        self.assertEqual(spec.facts["reading"], ())
+        self.assertEqual(spec.must_contain, ("hǎo",))
 
     def test_headword_only_meaning_is_skipped(self) -> None:
         """释义只讲「本字与某字组成的词」时不出题：`[～毒]` 里的 `～` 就是本字本身，删掉词头后
@@ -239,12 +260,12 @@ class IdsReverseTests(unittest.TestCase):
 
     def test_falls_through_to_next_meaning_block(self) -> None:
         """首块只有排版残片时改用后面有正文的释义库——实测大量字的首块就是孤零零一个 `<br>`。"""
-        character = make_character(meanings={"mean_h": ["<br>"], "mean_z": ["指事物令人满意。"]})
+        character = make_character(meanings={"mean_h": ["<br>"], "mean_z": ["拼音hao3<br>指事物令人满意。"]})
         spec = build_ids_reverse(
             character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
         )
         assert spec is not None
-        self.assertEqual(spec.facts["meaning_source"], "指事物令人满意。")
+        self.assertEqual(spec.facts["meaning_source"], "指事物令人满意")
 
     def test_reading_marker_is_stripped_from_meaning_source(self) -> None:
         """读音标注不进释义原文：留着它模型会把紧随其后的解释挂到读音上；
@@ -255,7 +276,22 @@ class IdsReverseTests(unittest.TestCase):
         )
         assert spec is not None
         self.assertNotIn("拼音", spec.facts["meaning_source"])
-        self.assertEqual(spec.facts["reading"], ("hao3",))
+        self.assertEqual(spec.facts["reading_display"], ["hǎo"])
+
+    def test_identification_condition_has_no_dictionary_markup(self) -> None:
+        """识别条件里不许出现字典排版残片（`～` / `【】`）——它们进了题干读者就读不懂，模型也只
+        能照抄。实测（语义池 760 条 T13）：21% 的题面带这类残片，最长的一条 194 字。
+        """
+        character = make_character(
+            meanings={"mean_h": ["ㄨㄩ拼音yi1<br>①归。<br>②同【依】。<br>鸡～。"]}
+        )
+        spec = build_ids_reverse(
+            character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
+        )
+        assert spec is not None
+        for text in (spec.instruction, spec.facts["meaning_source"]):
+            for mark in ("～", "【", "】"):
+                self.assertNotIn(mark, text)
 
 
 class ReadingTests(unittest.TestCase):
@@ -286,16 +322,94 @@ class ReadingTests(unittest.TestCase):
         进中文题干（`--limit 8` 探针里 T11/T13 的题干就是说明的要求句），数据于是不再是自然语言。
         所以要求句一律不进说明：禁令由程序侧闸门（`no_answer_leak` 等）兜，
         「题干里有没有夹要求」由 L4.6 往返检验判（那是 LLM 的事）。
+
+        说明的**句式**也有实测约束：写成完整问句（「「好」怎么读」）时 2B 会整句照抄（12 次里
+        9 次），数据里就是程序回声；写成名词性短语（「「好」的读音」）后照抄归零，12/12 都落成
+        了问句（探针 v10）。
         """
         character = make_character(meanings={"mean_h": ["\u62fc\u97f3hao4"]})
         spec = build_reading(character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character]))
         assert spec is not None
-        self.assertEqual(
-            spec.instruction,
-            "Ask the reader how the character \u300c\u597d\u300d is pronounced.",
-        )
+        self.assertEqual(spec.instruction, "\u300c\u597d\u300d\u7684\u8bfb\u97f3")
         self.assertNotIn("hao4", spec.instruction)
         self.assertIn("hao4", spec.accepted)
+
+
+class GlossPhraseTests(unittest.TestCase):
+    """`facts.gloss.gloss_phrase`：T13 的识别条件用它，所以它必须**只吐纯中文义项**。
+
+    预期：与 T17 的 `gloss_items` 共用同一套清洗（`_items_of_block`），字典排版残片一个都进不来；
+          义项之间用顿号连成**名词性短语**（出现句读就成了完整句子，2B 会整句照抄进题干）。
+    """
+
+    def test_senses_join_into_one_phrase(self) -> None:
+        """块内的分条按句读切开、用顿号连成一句。"""
+        self.assertEqual(gloss_phrase("归；归依。转身"), "归、归依")
+
+    def test_takes_at_most_max_items(self) -> None:
+        """识别条件取前两条义项就够，全铺开只会把题面拉长。"""
+        self.assertEqual(gloss_phrase("归。归依。转身。", max_items=3), "归、归依、转身")
+        self.assertEqual(gloss_phrase("归。归依。转身。", max_items=1), "归")
+
+    def test_long_single_sense_is_refused(self) -> None:
+        """单条义项超过上限（默认 9 字）时返回空串——这种字不出反向题。
+
+        预期：闸门 `no_source_copy` 数的是**连续汉字**，顿号会断开计数，所以每条义项 ≤9 字时
+              题干照实写也不会被判照抄；整句超过 9 字时 2B 改写不了、只能反复回炉
+              （实测短语 ≥10 字的 T13 被拒率 94%、<10 字的 32%）。
+        """
+        long_sense = "体型较小，背部青灰色，腹部黄褐色，嘴长而尖，脚短爪硬，善攀援树木"
+        self.assertEqual(gloss_phrase(long_sense + "。"), "")
+        # 长义项被跳过，短的首条义项仍然可用：
+        self.assertEqual(gloss_phrase("一种鸟。" + long_sense + "。"), "一种鸟")
+        # 边界：上限卡在汉字数上，「楸树的别称」是 5 个汉字。
+        self.assertEqual(gloss_phrase("楸树的别称。", max_chars=4), "")
+        self.assertEqual(gloss_phrase("楸树的别称。", max_chars=5), "楸树的别称")
+
+    def test_layout_fragments_are_dropped(self) -> None:
+        """`～`（词头）/ 括注 / 注音 / 互见这类排版残片不是义项——旧写法把它们原样写进题干
+        （「鸡～」「【儒】的民国一简」），194 字的题面读者读不懂、模型也只能照抄。"""
+        self.assertEqual(gloss_phrase("拼音xie2<br>[～毒]印度的古译名。"), "")
+        self.assertEqual(gloss_phrase("鸟类的胃：鸡～。"), "")
+        self.assertEqual(gloss_phrase("【儒】的民国一简。蔽。"), "蔽")
+        self.assertEqual(gloss_phrase("  　"), "")
+
+
+class InstructionCarriesGateStringsTests(unittest.TestCase):
+    """说明必须带上「题干必须原样出现的串」：候选 / 位置链 / 读音。
+
+    实测（本地 2B，温度 0.6）：这些串只放在 facts 里 2B 不捞——四个选择题型候选列全 0/8、
+    tier A 0/8；写进说明后 8/8 列全、tier A 11/12（probe_weave.jsonl）；T13 的读音 3/3、
+    释义 3/3（probe_t13.jsonl）。说明里缺了这些串，闸门就只能靠回炉，白烧配额。
+    """
+
+    def _specs(self) -> list:
+        """输入：无。输出：全题型覆盖池上跑出来的全部 TaskSpec。预期：供下面两条不变式共用。"""
+        characters = full_coverage_pool()
+        index = make_index(characters)
+        return [spec for character in characters for spec in build_all(character, rng=random.Random(5), index=index)]
+
+    def test_options_are_written_into_the_instruction(self) -> None:
+        """有候选的题（T10/T11/T16）说明里逐个写出候选——模型照抄说明就有得选。"""
+        seen = 0
+        for spec in self._specs():
+            if not spec.options:
+                continue
+            seen += 1
+            for option in spec.options:
+                self.assertIn(option, spec.instruction, f"{spec.task_id} 的说明里漏了候选 {option!r}")
+        self.assertGreater(seen, 0, "样本里一个选择题都没有，这条不变式就白测了")
+
+    def test_required_strings_are_written_into_the_instruction(self) -> None:
+        """必现串（T9 的位置链 / T13 的读音 / T10·T11 的比较对象）同样写进说明。"""
+        checked = 0
+        for spec in self._specs():
+            if not spec.must_contain:
+                continue
+            checked += 1
+            for item in spec.must_contain:
+                self.assertIn(item, spec.instruction, f"{spec.task_id} 的说明里漏了必现串 {item!r}")
+        self.assertGreater(checked, 0, "样本里一个带必现串的题都没有")
 
 
 class DifficultyTests(unittest.TestCase):
@@ -339,9 +453,36 @@ class DifficultyTests(unittest.TestCase):
         self.assertTrue(all(spec.resolved_depth in {"near", "mid", "far"} for spec in specs))
         self.assertEqual(len({spec.resolved_depth for spec in specs}), 1)  # 同一个字只抽一次
 
+    def test_mixed_levels_resolve_to_concrete_values(self) -> None:
+        """hops / constraints 的 `mixed` 必须落成 1..3 的具体值，且三档都抽得到。"""
+        rng = random.Random(20261006)
+        self.assertEqual({resolve_hops(MIXED_LEVEL, rng) for _ in range(200)}, {1, 2, 3})
+        self.assertEqual({resolve_constraints(MIXED_LEVEL, rng) for _ in range(200)}, {1, 2, 3})
+        self.assertEqual(resolve_hops(2, rng), 2)
+        self.assertEqual(resolve_constraints(3, rng), 3)
+
+    def test_fixed_levels_do_not_consume_randomness(self) -> None:
+        """固定档位不消耗随机数——否则固定档位的产出会被无谓扰动。"""
+        rng = random.Random(7)
+        self.assertEqual(resolve_hops(3, rng), 3)
+        self.assertEqual(resolve_constraints(2, rng), 2)
+        self.assertEqual(rng.random(), random.Random(7).random())
+
+    def test_rejects_bogus_levels(self) -> None:
+        """非 1..3 且非 mixed 的档位当场报错，不静默降级。"""
+        for bad in (0, 4, "2", "MIX", True):
+            with self.assertRaises(ValueError):
+                Difficulty(hops=bad)
+            with self.assertRaises(ValueError):
+                Difficulty(constraints=bad)
+
     def test_every_task_declares_a_machine_facing_instruction(self) -> None:
-        """每个题型都必须给出**英文**的机器面出题说明——程序侧文本一律英文，模型抄不进
-        中文题干（实测 instruction 写中文时 2B 一字不改地把它当题干输出）。"""
+        """每个题型都必须给出**一句中文的「要问什么」**，不带程序口吻。
+
+        预期：说明是一个**名词性短语**（「「㐀」的总笔画数」）——不带「问读者」这类口吻、
+              不带句读、不带写作要求。带了口吻（实测「问读者：…」）或写成完整问句时，2B 会
+              把它原样抄进产出，数据集里就出现程序回声（探针 v9–v11：照抄 9/12 → 0/12）。
+        """
         character = make_character(
             zi="\u3400",
             ids=("\u2ff1\u535d\u4e00",),
@@ -357,20 +498,96 @@ class DifficultyTests(unittest.TestCase):
             if spec is None:
                 continue
             checked += 1
-            self.assertGreaterEqual(len(spec.instruction), 40, f"{task_id} 的出题说明太短")
-            for mark in ("\u3002", "\uff0c", "\uff1b", "\uff1a"):
-                self.assertNotIn(mark, spec.instruction, f"{task_id} 的出题说明里出现中文句读 {mark!r}")
-            # 说明**只说问什么**：以 Ask the reader 开头、只有一个句子。
-            # 实测多出来的那几句（「List every candidate」「No digit may appear in the stem」）会被
+            instruction = spec.instruction
+            self.assertGreaterEqual(len(instruction), 5, f"{task_id} 的出题说明太短")
+            for mark in ("\u3002", "\uff1b", "\uff1a", "\uff01", "\uff1f", "!", "?", "."):
+                self.assertNotIn(mark, instruction, f"{task_id} 的出题说明里出现句读 {mark!r}")
+            # 说明只说「问什么」：多出来的那几句（「List every candidate」这类写作要求）会被
             # 2B 翻译成中文题干里的要求句，产出就不再是自然语言。
-            self.assertTrue(
-                spec.instruction.startswith("Ask the reader"), f"{task_id} 的出题说明不是「问什么」句"
-            )
-            self.assertEqual(
-                spec.instruction.count(". "), 0, f"{task_id} 的出题说明不止一句话（多半夹了写作要求）"
-            )
-            self.assertTrue(spec.instruction.endswith("."), f"{task_id} 的出题说明没有收尾句号")
+            for mouth in ("\u95ee\u8bfb\u8005", "\u8bfb\u8005", "\u9898\u5e72", "\u9898\u76ee", "\u51fa\u9898"):
+                self.assertNotIn(mouth, instruction, f"{task_id} 的出题说明带了程序口吻 {mouth!r}")
         self.assertGreater(checked, 0)
+
+
+class DifficultyLadderTests(unittest.TestCase):
+    """输入：若干字的 T9 / T8 构造。输出：断言。
+    预期：难度旋钮真的作用到产出上——抽到多跳就出多跳题，链接不起来才退档，
+          退档结果如实写进 `resolved_hops` / `resolved_constraints`，而不是永远写配置档。
+    """
+
+    @staticmethod
+    def _chain_index():
+        """输入：无。输出：一条能走 2~3 跳的部件链索引。预期：中间件都在池里且有 IDS。"""
+        return make_index(
+            [
+                make_character(zi="\u3400", ziid="U03400", ids=("\u2ff1\u4e00\u4e01",), stroke=3, radical="\u4e00"),
+                make_character(zi="\u4e00", ziid="U04E00", ids=("\u2ff0\u4e8c\u4e01",), stroke=1, radical="\u4e00"),
+                make_character(zi="\u4e8c", ziid="U04E8C", ids=("\u2ff0\u4e00\u4e01",), stroke=2, radical="\u4e8c"),
+                make_character(zi="\u4e01", ziid="U04E01", ids=("\u2ff0\u4e00\u4e01",), stroke=2, radical="\u4e00"),
+            ]
+        )
+
+    def test_sampled_hops_reach_the_dataset(self) -> None:
+        """池里备齐中间件时，抽到多跳就真的出多跳题——难度旋钮不是摆设。"""
+        character = make_character(
+            zi="\u3400", ziid="U03400", ids=("\u2ff1\u4e00\u4e01",), stroke=3, radical="\u4e00"
+        )
+        index = self._chain_index()
+        depths = set()
+        for seed in range(20):
+            specs = build_all(
+                character, rng=random.Random(seed), index=index,
+                difficulty=Difficulty(hops=3), only=("T9_component_chain",),
+            )
+            if specs:
+                depths.add(specs[0].resolved_hops)
+                self.assertEqual(specs[0].facts["depth"], specs[0].resolved_hops)
+        self.assertTrue(depths & {2, 3}, f"20 个种子里一条多跳都出不来：{sorted(depths)}")
+
+    def test_unreachable_hops_fall_back_instead_of_dropping(self) -> None:
+        """链接不起来时退到 1 跳，字不会整型消失；`resolved_hops` 写退档后的值。"""
+        character = make_character(
+            zi="\u3400", ziid="U03400", ids=("\u2ff1\u535d\u4e00",), stroke=3, radical="\u4e00"
+        )
+        index = make_index([character])  # 部件「卝」「一」都不在池里 -> 2 跳必然接不上
+        specs = build_all(
+            character, rng=random.Random(5), index=index,
+            difficulty=Difficulty(hops=3), only=("T9_component_chain",),
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].resolved_hops, 1)
+        self.assertEqual(specs[0].facts["depth"], 1)
+
+    def test_constraint_ladder_records_the_used_level(self) -> None:
+        """T8 落定的约束档位必须与产出 facts 里的条件条数一致，且不高于抽到的档位。"""
+        pool = full_coverage_pool()
+        index = make_index(pool)
+        checked = 0
+        for character in pool:
+            for seed in range(10):
+                specs = build_all(
+                    character, rng=random.Random(seed), index=index,
+                    difficulty=Difficulty(constraints=3), only=("T8_constraint",),
+                )
+                if not specs:
+                    continue
+                spec = specs[0]
+                used = 1 + ("structure" in spec.facts) + ("component_count" in spec.facts)
+                self.assertEqual(spec.resolved_constraints, used)
+                self.assertLessEqual(used, 3)
+                checked += 1
+        self.assertGreater(checked, 0, "覆盖池里一条 T8 都出不来")
+
+    def test_non_consumer_tasks_record_baseline_levels(self) -> None:
+        """不消费旋钮的题型如实写 1 / 1，不把配置档抄进 `resolved_*`。"""
+        character = make_character()
+        specs = build_all(
+            character, rng=random.Random(1), index=make_index([character]),
+            difficulty=Difficulty(hops=3, constraints=3), only=("T1_stroke_total",),
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].resolved_hops, 1)
+        self.assertEqual(specs[0].resolved_constraints, 1)
 
 
 class RegistryTests(unittest.TestCase):
@@ -390,13 +607,13 @@ class RegistryTests(unittest.TestCase):
             "T14_unicode_codepoint",
             "T15_unicode_bytes",
             "T16_unicode_reverse",
+            "T17_meaning_gloss",
             "T1_stroke_total",
             "T3_ids_forward",
             "T4_reading",
             "T5_standard_form",
             "T5_variant",
             "T6_zh_ref",
-            "T7_meaning_source",
             "T8_constraint",
             "T9_component_chain",
         ]
@@ -496,7 +713,7 @@ class PerTaskStructuralInvariantTests(unittest.TestCase):
         builders = (
             glyph.build_stroke_total, glyph.build_ids_forward, glyph.build_ids_reverse,
             reading.build_reading, relations.build_standard_form, relations.build_variant,
-            relations.build_reference, relations.build_meaning_source,
+            relations.build_reference,
             uni.build_unicode_codepoint, uni.build_unicode_bytes, uni.build_unicode_reverse,
         )
         checked = 0
@@ -523,7 +740,10 @@ class PerTaskStructuralInvariantTests(unittest.TestCase):
                     for candidate in facts["ids"]:
                         self.assertIn(candidate, source.ids_candidates)
                 elif tid == "T4_reading":
-                    self.assertEqual(answer, facts["reading"])
+                    # 答案在等价写法之间轮换（`xie2` / `xié` 是一个东西）：facts 给的是
+                    # canonical 与展示写法，答案是其中一个 surface，其余进 answer_aliases。
+                    self.assertIn(answer, reading_surfaces(facts["reading"]))
+                    self.assertIn(facts["reading"], spec.accepted)
                 elif tid == "T5_standard_form":
                     self.assertEqual(answer, facts["standard_form"])
                     self.assertEqual(source.standard_form, facts["standard_form"])
@@ -533,9 +753,6 @@ class PerTaskStructuralInvariantTests(unittest.TestCase):
                 elif tid == "T6_zh_ref":
                     self.assertEqual(answer, str(facts["page"]))
                     self.assertIn(facts["page"], {v for ref in source.refs.values() for v in ref.values()})
-                elif tid == "T7_meaning_source":
-                    self.assertEqual(answer, facts["source"])
-                    self.assertIn(answer, facts["options"])
                 elif tid == "T14_unicode_codepoint":
                     self.assertIn(answer, facts["codepoint_forms"])  # 两种写法（带/不带 U+）都合法
                     self.assertIn(f"U+{ord(source.zi):04X}", facts["codepoint_forms"])
@@ -634,26 +851,24 @@ class PerTaskStructuralInvariantTests(unittest.TestCase):
 
 class ChoiceTaskRequirementTests(unittest.TestCase):
     """输入：真实字表（`chars.jsonl`）。输出：断言。
-    预期：凡是声明了 `options` 的题，候选都必须**原样进 `stem_must_contain`**——那是模型
-          真正看到的硬约束，也是 `options_listed` 闸门的判据。只写在散文说明里模型会漏，
-          实测 16b 的 T11 产出就是「下面是一些有趣的汉字。请问总笔画数最少的是哪一个？」
-          （一个候选都没列，读者根本没得选）。
+    预期：凡是声明了 `options` 的题，候选都必须**原样进载荷的 `options`**——那是模型真正
+          看到的候选清单，也是 `options_listed` 闸门的判据。模型看不到候选就会写出
+          「下面是一些有趣的汉字。请问总笔画数最少的是哪一个？」（实测 16b 的 T11 一个候选
+          都没列，读者根本没得选）。
     """
 
     def test_options_are_always_demanded_in_the_stem(self) -> None:
-        """四种选择题都必须把候选送进 `stem_must_contain`（题干必须逐个原样列出）。"""
+        """四种选择题都必须把候选送进载荷（题干必须逐个原样列出）。"""
         from hanzi_synth.facts.index import CharacterIndex
         from hanzi_synth.facts.loader import iter_characters
-        from hanzi_synth.llm.verbalizer import payload_for
+        from hanzi_synth.llm.verbalizer import _alias, _alias_map, payload_for
         from hanzi_synth.tasks.base import Difficulty
         from hanzi_synth.tasks.reasoning import build_odd_one_out, build_stroke_extreme
-        from hanzi_synth.tasks.relations import build_meaning_source
         from hanzi_synth.tasks.unicode import build_unicode_reverse
 
         builders = {
             "T10_odd_one_out": build_odd_one_out,
             "T11_stroke_extreme": build_stroke_extreme,
-            "T7_meaning_source": build_meaning_source,
             "T16_unicode_reverse": build_unicode_reverse,
         }
         characters = list(iter_characters())
@@ -672,57 +887,17 @@ class ChoiceTaskRequirementTests(unittest.TestCase):
                 seen.add(task_id)
                 self.assertTrue(spec.options, f"{task_id} 是选择题却没声明 options")
                 payload = payload_for(spec)
+                # 生僻字会被换成 `[[1]]` 这类代号（程序回填），所以比对时先过一遍同一个映射。
+                aliases = _alias_map(spec)
                 for option in spec.options:
                     self.assertIn(
-                        option,
-                        payload["stem_must_contain"],
-                        f"{task_id} 的候选 {option!r} 没进 stem_must_contain——模型会照抄"
+                        _alias(option, aliases),
+                        payload["options"],
+                        f"{task_id} 的候选 {option!r} 没进载荷——模型会照抄"
                         "「下列选项」这种没有清单的句式，把候选整个漏掉（实测 16b 的 T11）",
                     )
         self.assertEqual(seen, set(builders), "样本里没凑齐这四种选择题")
 
-def _full_coverage_pool() -> list:
-    """输入：无。输出：一批**能覆盖全部 16 个题型**的假字记录 + 索引。
-
-    预期：这批字是给「每个题型都必须声明题干闸门」这条不变式用的——覆盖不全，
-          闸门漏装也测不出来（第十轮 T12 的 `_TRANSFORM_ASK_MARKERS` 定义了却没接上，
-          就是这么漏的）。各字的取材理由：
-          - 㐀：有 IDS / 部首 / 标准字形 / 异体 / 页码，覆盖字形与字际关系一族；
-          - 好：释义里带拼音，T4 才有唯一读音可出；
-          - 一 / 丁 / 七 / 三 / 上：同一部首、笔画互有重叠，给 T8 约束桶与 T10/T11 凑同伴；
-          - 㐄：部首「一」+ 5 画在池里独一份，T8 的唯一解条件才成立。
-    """
-    return [
-        make_character(
-            zi="\u3400",
-            ziid="U03400",
-            ids=("\u2ff0\u4e00\u4e01",),
-            stroke=3,
-            radical="\u4e00",
-            standard_form="\u4e00",
-            variants=("\u4e01",),
-            meanings={"mean_h": ("\u53e4\u540c\u300c\u4e00\u300d\u3002",)},
-            refs={"zh": {"page": 12, "number": 3}, "meaning_src": {"\u5b57\u6d77": 1}},
-        ),
-        make_character(zi="\u4e01", ziid="U04E01", ids=("\u2ff0\u4e00\u4e01",), stroke=2, radical="\u4e00",
-                       meanings={"mean_h": ("\u5929\u5e72\u7b2c\u56db\u4f4d\u3002",)}),
-        make_character(zi="\u4e03", ziid="U04E03", ids=("\u2ff0\u4e00\u4e01",), stroke=2, radical="\u4e00",
-                       meanings={"mean_h": ("\u6570\u76ee\u3002",)}),
-        make_character(zi="\u4e09", ziid="U04E09", ids=("\u2ff0\u4e00\u4e01",), stroke=3, radical="\u4e00",
-                       meanings={"mean_h": ("\u6570\u76ee\u3002",)}),
-        make_character(zi="\u4e0a", ziid="U04E0A", ids=("\u2ff0\u4e00\u4e01",), stroke=3, radical="\u4e00",
-                       meanings={"mean_h": ("\u6570\u76ee\u3002",)}),
-        make_character(zi="\u597d", ziid="U0597D", ids=("\u2ff0\u5973\u5b50",), stroke=6, radical="\u5973",
-                       meanings={"mean_h": ("\u62fc\u97f3hao3\u7f8e\u597d\u3002",)}),
-        make_character(zi="\u5982", ziid="U05982", ids=("\u2ff0\u5973\u53e3",), stroke=6, radical="\u5973",
-                       meanings={"mean_h": ("\u987a\u4ece\u3002",)}),
-        make_character(zi="\u59d0", ziid="U059D0", ids=("\u2ff0\u5973\u4e14",), stroke=8, radical="\u5973",
-                       meanings={"mean_h": ("\u59d0\u59d0\u3002",)}),
-        make_character(zi="\u59b9", ziid="U059B9", ids=("\u2ff0\u5973\u672a",), stroke=8, radical="\u5973",
-                       meanings={"mean_h": ("\u59b9\u59b9\u3002",)}),
-        make_character(zi="\u3404", ziid="U03404", ids=("\u2ff0\u4e00\u4e01",), stroke=5, radical="\u4e00",
-                       meanings={"mean_h": ("\u53e4\u5b57\u3002",)}),
-    ]
 
 
 class StemAsksGateCoverageTests(unittest.TestCase):
@@ -736,7 +911,7 @@ class StemAsksGateCoverageTests(unittest.TestCase):
         预期：池子真能出满 16 个题型（覆盖不全这条测试就没意义），且每条产出的
               `stem_asks_any` 都非空。
         """
-        pool = _full_coverage_pool()
+        pool = full_coverage_pool()
         index = make_index(pool)
         seen: set[str] = set()
         for character in pool:
@@ -753,7 +928,7 @@ class StemAsksGateCoverageTests(unittest.TestCase):
         预期：这张表是复验（`spec_from_record`）补闸门用的唯一来源，一旦构造器改了闸门而表没跟，
               复验就会拿旧闸门去查——「题干问错事」的废题会重新漏过去。
         """
-        pool = _full_coverage_pool()
+        pool = full_coverage_pool()
         index = make_index(pool)
         actual: dict[str, tuple[str, ...]] = {}
         for character in pool:
@@ -764,3 +939,69 @@ class StemAsksGateCoverageTests(unittest.TestCase):
         self.assertEqual(set(actual), set(TASK_STEM_ASKS))
         for task_id, markers in actual.items():
             self.assertEqual(markers, TASK_STEM_ASKS[task_id], task_id)
+
+
+class PayloadFactsCoverageTests(unittest.TestCase):
+    """措辞层载荷的裁剪不变式：每个题型都必须声明「这道题要发给模型的事实键」。
+
+    构造器的 `facts` 是给闸门 / 离线渲染用的**全集**，措辞模型只需要其中写这道题要引用的
+    那几个值。不声明时 `payload_for` 把整份 facts 发过去，模型就会拿别的题的材料当素材——
+    实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，产出写成「给出码位 E3 90 8B，
+    让读者从下列选项中选出对应的字」；T1 问笔画却带着 `radical` 与 `ids`。
+    声明写错（键名打错、抄了别型的键）会让载荷缺料、产出被闸门拒收，所以键必须在 facts 里。
+    """
+
+    def test_every_task_declares_payload_facts_present_in_facts(self) -> None:
+        """输入：覆盖全部题型的假字池。输出：无。
+        预期：池子出满全部注册题型；每条的 `payload_facts` 非空，且每个键都在 `spec.facts` 里。
+        """
+        pool = full_coverage_pool()
+        index = make_index(pool)
+        seen: set[str] = set()
+        for character in pool:
+            for spec in build_all(
+                character, rng=random.Random(7), index=index, difficulty=Difficulty(distractor_depth="far")
+            ):
+                seen.add(spec.task_id)
+                self.assertTrue(spec.payload_facts, f"{spec.task_id} 没声明 payload_facts")
+                missing = [key for key in spec.payload_facts if key not in spec.facts]
+                self.assertEqual(missing, [], f"{spec.task_id} 声明的载荷键不在 facts 里：{missing}")
+        self.assertEqual(seen, set(CONSTRUCTORS))
+
+    def test_payload_sends_only_declared_keys(self) -> None:
+        """输入：一条带多余 facts 的 spec。输出：无。
+        预期：载荷 facts 的键 = 声明的键；多余的一个都不发。
+        """
+        from hanzi_synth.llm.verbalizer import payload_for
+        from hanzi_synth.tasks.base import TaskSpec
+
+        spec = TaskSpec(
+            task_id="T1_stroke_total",
+            instruction="「好」的总笔画数",
+            facts={"zi": "好", "stroke_total": 6, "radical": "女", "ids": ["⿰女子"]},
+            answer="6",
+            payload_facts=("zi", "stroke_total"),
+        )
+        self.assertEqual(set(payload_for(spec)["facts"]), {"zi", "stroke_total"})
+
+    def test_meaning_gloss_payload_hides_the_source_dictionary(self) -> None:
+        """输入：假字池里的一条 T17 spec。输出：无。
+
+        预期：出处仍留在 `facts.source` 里供溯源，但**不进提示词载荷**——书名一进载荷，2B 就把它
+        写进产出（实测 1,174/3,401 条带「根据康熙字典 / 根据《中华字海》的释义 / 出自《中华字海》」）。
+        """
+        from hanzi_synth.llm.verbalizer import payload_for
+
+        pool = full_coverage_pool()
+        index = make_index(pool)
+        spec = next(
+            built
+            for character in pool
+            for built in build_all(
+                character, rng=random.Random(7), index=index, difficulty=Difficulty()
+            )
+            if built.task_id == "T17_meaning_gloss"
+        )
+        self.assertIn("source", spec.facts, "出处要留在 facts 里供溯源")
+        self.assertNotIn("source", spec.payload_facts)
+        self.assertNotIn("source", payload_for(spec)["facts"])

@@ -17,7 +17,8 @@
 - `--unique-by task-zi` 才按 (题型, 字) 收唯一（默认全收——「合成足够多」优先，重复量在报告里
   如实报出来，由使用者决定要不要收唯一）；
 - **自然语言那一层也在这道门里**：机械闸门只做子串 / 集合比对，判不了「这段话读者读得懂吗」。
-  所以 `roundtrip`（把题干交回模型答题的判定）是发布必查项，往返否决的记录同样不发。
+  所以 `roundtrip`（把题干交回模型答题的判定）是发布必查项：往返否决的记录不发，往返**缺席**
+  （请求挂了 / 输出坏了）的记录同样不发——缺席不算否决，也不算通过（见 `llm/roundtrip.py:38`）。
 
 为什么需要它：产出目录里躺的是**历轮实验的原始日志**，每条记录是「当时那一版代码」判过的。
 判据只增不减，旧文件里必然留着今天判不过的记录（实测 46 条，其中 34 条选择题的题干根本没列
@@ -25,8 +26,12 @@
 
 数据集记录的字段：
 - `stem` / `explanation`：与源记录逐字相同（本工具不改写文本）；
-- `verification`：**按本记录自己的文本重算**——源记录里的那一份是旧代码对旧文本的结论，
-  留着会让「判定」与「文本」对不上；
+- `verification`：**机械闸门按本记录自己的文本重算**——源记录里的那一份是旧代码对旧文本的
+  结论，留着会让「判定」与「文本」对不上；但**LLM 那一道认记录里的结论**（`roundtrip` / `judge`
+  两个 dict，以及答案仲裁的痕迹 `semantic_answer`）：它们重跑不了，而重跑机械闸门会把「主流程
+  靠 LLM 仲裁撤掉的那条 `answer_in_explanation`」重新判成失败——同一条数据两处结论相反，
+  实测 93 条被剔记录里 62 条就是这么来的（解析用「左右结构，左边是亻」这种散文说出答案，
+  子串比对判不出，LLM 仲裁判得出）；
 - `audit`：`{"source": 源文件名, "recheck": 复验强度}`，说明这条从哪个文件来、查得严不严。
 """
 
@@ -34,13 +39,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..llm.verbalizer import Verbalized
 from ..verify.checks import verify
 from .dedup import load_jsonl
-from .run import _judge_vetoed, _roundtrip_vetoed, spec_from_record
+from .run import _round_passed, _round_reasons, spec_from_record
 
 # 旁路文件后缀：这些不是产出，是日志 / 报告 / 备份。
 # `--in` 给目录时按名字剔掉；给具体文件时不剔——使用者显式点名了就照做。
@@ -78,6 +84,26 @@ GATE_FIELDS: tuple[str, ...] = (
 # 缺 `roundtrip` 与缺机械闸门字段是两回事，旁路文件里要分开说清楚。
 LLM_GATE_NOTE = "；roundtrip 缺失 = 自然语言那一层没被判过（机械闸门只比子串，判不了可读性）"
 
+# 离线模板产出的 provenance 标记（只由 `render.generate` 写，措辞路径不带这个键）。
+# 为什么它可以不要求 `roundtrip`：往返检验查的是**模型写的那段自然语言**读不读得懂
+# （实测 2B 会把出题说明整段抄成题干）。离线产出的自然语言**不是模型写的**——是程序按
+# 人手写的句式池 + 字典事实拼出来的，检验对象不存在；它的自然语言那一层由句式池本身 +
+# 全量重渲染确定性保证（`rerender_offline.py`：705,175 条 0 条不一致）。
+# 豁免**只认这个标记**，不认「roundtrip 恰好缺失」——否则任何模型产出只要漏掉这一键就能
+# 免检发布，那正是本门禁要拦的事。
+OFFLINE_MODE = "offline-template"
+
+
+def is_offline_template(row: Mapping[str, Any]) -> bool:
+    """输入：一条产出记录。输出：它是不是离线模板产出（自然语言由程序拼出）。
+    预期：只认 `provenance.mode == "offline-template"`；`provenance` 缺失 / 不是映射 /
+    `mode` 是别的值一律 False——豁免口径必须比「键在不在」严，不能靠缺字段蒙混。
+    """
+    provenance = row.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    return str(provenance.get("mode", "")) == OFFLINE_MODE
+
 
 def _missing_gates(row: Mapping[str, Any]) -> list[str]:
     """输入：一条产出记录。输出：缺掉的闸门字段名（按 `GATE_FIELDS` 顺序）。
@@ -85,9 +111,14 @@ def _missing_gates(row: Mapping[str, Any]) -> list[str]:
     预期：`roundtrip` 这一项**必须是判定本身**——记录里写成 `null`（跑的时候关了往返检验）
           与键根本不在，都算没查过。其余字段只判「在不在」：`visible_subject` 为空串
           是合法值（选择题没有单一主语），不能拿真假值去判。
+          离线模板产出（`is_offline_template`）**不要求 `roundtrip`**：见 `OFFLINE_MODE`
+          那段——它的自然语言不是模型写的。其余机械闸门字段照样一个不能缺。
     """
-    missing = [field for field in GATE_FIELDS if field not in row]
-    if "roundtrip" in row and not isinstance(row.get("roundtrip"), dict):
+    required = GATE_FIELDS if not is_offline_template(row) else tuple(
+        field for field in GATE_FIELDS if field != "roundtrip"
+    )
+    missing = [field for field in required if field not in row]
+    if "roundtrip" in required and not isinstance(row.get("roundtrip"), dict):
         missing.append("roundtrip")
     return missing
 
@@ -97,6 +128,8 @@ def recheck_strength(row: Mapping[str, Any]) -> str:
     预期：`partial` = 记录缺闸门字段，复验只跑到「从记录本身能重建」的那些防线。
           这不是「这条有问题」，而是「这条查得没那么严」——报告要如实说清楚，
           **调用方据它决定不发**：查得没那么严的记录不许进数据集。
+          离线模板产出只要机械闸门字段齐全就是 `full`：它的 `roundtrip` 本来就没有对象
+          （`OFFLINE_MODE`），把「没有对象」当成「查得不严」会让整批离线数据一条都发不出去。
     """
     return "full" if not _missing_gates(row) else "partial"
 
@@ -156,12 +189,37 @@ def is_published_record(row: Mapping[str, Any]) -> bool:
     return "stem" in row and "explanation" in row
 
 
+# 记录里「子串比对没过、但 LLM 仲裁判过」的痕迹前缀。主流程 `run._verified_with_semantic_answer`
+# 撤掉那条失败时写的就是它（见 `verify/checks.Verification.semantic_answer`）。
+_SEMANTIC_ARBITRATION_PREFIX = "LLM 仲裁"
+
+
+def recorded_answer_arbitration(row: Mapping[str, Any]) -> str:
+    """输入：一条产出记录。输出：记录里那次「子串比对没过、但 LLM 仲裁判过」的痕迹（没有则空串）。
+
+    预期：只在记录**自己写着** `answer_in_explanation` 为真、且 `semantic_answer` 是仲裁结论时
+          才算数——那正是主流程撤掉这条失败、于是把记录发布出去的那一刻。
+          「解析说没说答案」是 **LLM 那一道**，与 `roundtrip` / `judge` 同类：本工具重跑不了，
+          只认记录里的结论。不认它就会出现「主流程发布、门禁剔掉」这种自相矛盾。
+    """
+    recorded = row.get("verification")
+    if not isinstance(recorded, Mapping) or not recorded.get("answer_in_explanation"):
+        return ""
+    note = str(recorded.get("semantic_answer") or "")
+    return note if note.startswith(_SEMANTIC_ARBITRATION_PREFIX) else ""
+
+
 def audit_record(row: Mapping[str, Any]) -> dict[str, Any]:
     """输入：一条已发布产出记录。输出：判定结果。
 
-    预期：判定口径与主流程完全一致——`spec_from_record` 重建 TaskSpec，`verify` 用同一份防线；
-          `judge_vetoed` / 往返检验都取记录里落盘的判定（**缺席不算否决**：请求挂了是工具问题，
-          不是数据问题）。本工具**不改写文本**，所以只有一个 `keep` 结论。
+    预期：判定口径与主流程**完全同一份实现**——`spec_from_record` 重建 TaskSpec、`verify` 跑同一
+          份防线、`_round_passed` 当发布判据、`_round_reasons` 出失败原因。在这里另写一套必然漂移：
+          实测旧版就漏了「模型侧检验**缺席**」这一档——缺席既不是否决也不是通过（见
+          `llm/roundtrip.py:38`），没被检验过的记录同样不能进数据集。本工具**不改写文本**，
+          所以只有一个 `keep` 结论。
+          答案那一格还有一层：`answer_in_explanation` 是子串比对，主流程在它没过时还会问一次
+          LLM 仲裁并撤掉这条失败；本工具重跑不了那一次，按记录里的痕迹认它
+          （`recorded_answer_arbitration`），否则「主流程发布、门禁剔掉」会同时发生在一条数据上。
     """
     spec = spec_from_record(row)
     original = Verbalized(
@@ -172,12 +230,28 @@ def audit_record(row: Mapping[str, Any]) -> dict[str, Any]:
         model=str(row.get("model", "") or ""),
     )
     verification = verify(spec, original)
-    vetoed = _judge_vetoed(row.get("judge")) or _roundtrip_vetoed(row.get("roundtrip"))
+    arbitration = recorded_answer_arbitration(row)
+    if arbitration and not verification.answer_in_explanation:
+        # 机械复验只会做子串比对，而主流程在这一格上还问过 LLM 仲裁并撤掉了这条失败。
+        # 按记录撤掉它：`failures` / `notes` 是同一批失败的两份说法，撤一条要两边一起撤。
+        kept = [
+            (failure, note)
+            for failure, note in zip(verification.failures, verification.notes)
+            if not failure.startswith("answer_in_explanation")
+        ]
+        verification = replace(
+            verification,
+            answer_in_explanation=True,
+            semantic_answer=arbitration,
+            failures=tuple(failure for failure, _ in kept),
+            notes=tuple(note for _, note in kept),
+        )
+    judgement = row.get("judge")
+    roundtrip = row.get("roundtrip")
     return {
         "tier": verification.tier,
-        "failures": list(verification.failures),
-        "judge_vetoed": vetoed,
-        "keep": verification.tier == "A" and not vetoed,
+        "failures": _round_reasons(verification.tier, verification.failures, judgement, roundtrip),
+        "keep": _round_passed(verification.tier, judgement, roundtrip),
         "verification": verification,
     }
 
@@ -201,9 +275,44 @@ def _dataset_row(row: Mapping[str, Any], outcome: Mapping[str, Any], source: str
     return out
 
 
+# 回炉载荷要带的字段：构造器 / 闸门侧的全部输入。`spec_from_record` 只认这些键，
+# `stem` / `explanation` / `verification` 一律不带——回炉要**重写**文本，带上旧文本只会被照抄。
+REPLAY_FIELDS: tuple[str, ...] = (
+    "instruction",
+    "facts",
+    "answer",
+    "accepted",
+    "options",
+    "visible_subject",
+    "must_contain",
+    "hidden_subject",
+    "stem_asks_any",
+    "structure_words",
+    "payload_facts",
+    "proof",
+    "distractors",
+    "provenance",
+)
+
+
+def _replay_payload(row: Mapping[str, Any]) -> dict:
+    """输入：产出记录。输出：可直接喂 `cli replay` 的回炉载荷。
+    预期：形状与 `run.py` 写 rejects 时的 `spec` 载荷一致（`_offline_record` 的产物），
+          键按 `REPLAY_FIELDS` 挑；缺字段就不带（`spec_from_record` 有安全默认值）。
+          「不进数据集」不等于「可以丢」——没有这份载荷，旁路文件只剩定位信息，
+          回炉时要人工回源文件里找，等于事实上的丢弃。
+    """
+    payload: dict[str, Any] = {"task_id": str(row.get("task_id", "")), "ziid": str(row.get("ziid", ""))}
+    for field in REPLAY_FIELDS:
+        if field in row:
+            payload[field] = row[field]
+    return payload
+
+
 def _dropped_row(row: Mapping[str, Any], outcome: Mapping[str, Any], source: str) -> dict:
     """输入：源记录 + 判定结果 + 源文件名。输出：被剔除记录的旁路行。
-    预期：只留定位信息与原因（不进数据集就不该再带整条正文，旁路文件要能一眼扫完）。
+    预期：定位信息 + 原因 + **回炉载荷**（`spec`）——不带整条正文（stem / explanation 不进旁路），
+          但必须能重建 TaskSpec，否则回炉无从下手（见 `_replay_payload`）。
     """
     return {
         "task_id": row.get("task_id", ""),
@@ -211,13 +320,15 @@ def _dropped_row(row: Mapping[str, Any], outcome: Mapping[str, Any], source: str
         "source": source,
         "tier": outcome["tier"],
         "failures": list(outcome["failures"]),
+        "spec": _replay_payload(row),
     }
 
 
 def _unverifiable_row(row: Mapping[str, Any], source: str) -> dict:
     """输入：缺闸门字段的产出记录 + 源文件名。输出：旁路行。
-    预期：与 `_dropped_row` 同一形状，但 `tier` 记 `unverifiable`、`failures` 点明缺了什么——
-          这不是「内容不合格」，而是「这条查不严，所以不发布」，两种原因不能在旁路文件里混成一种。
+    预期：与 `_dropped_row` 同一形状（含回炉载荷），但 `tier` 记 `unverifiable`、`failures`
+          点明缺了什么——这不是「内容不合格」，而是「这条查不严，所以不发布」，
+          两种原因不能在旁路文件里混成一种。
     """
     missing = _missing_gates(row)
     return {
@@ -230,6 +341,7 @@ def _unverifiable_row(row: Mapping[str, Any], source: str) -> dict:
             "「题干有没有写出那个字」这类判据全部失效，所以不发布（当前管线重新合成即可）"
             + (LLM_GATE_NOTE if "roundtrip" in missing else "")
         ],
+        "spec": _replay_payload(row),
     }
 
 
@@ -260,6 +372,7 @@ def audit_sources(
     partial_recheck = 0
     partial_dropped = 0
     partial_sources: Counter[str] = Counter()
+    offline_records = 0
     already_assembled = 0
     assembled_sources: Counter[str] = Counter()
 
@@ -282,6 +395,10 @@ def audit_sources(
                 non_record_sources[path.name] += 1
                 source_non_records += 1
                 continue
+            if is_offline_template(row):
+                # 只计数：这类记录不要求 roundtrip（见 `OFFLINE_MODE`），报告里要如实报出来，
+                # 免得「数据集里有多少条没被读者读过」变成一个看不见的数。
+                offline_records += 1
             partial = recheck_strength(row) == "partial"
             if partial:
                 # 缺闸门字段 = 复验降级 = 没查严。**不发布**，也不浪费一次降级复验：
@@ -342,6 +459,8 @@ def audit_sources(
         "recheck_partial": partial_recheck,
         "recheck_partial_dropped": partial_dropped,
         "recheck_partial_by_source": dict(partial_sources.most_common()),
+        "offline_records": offline_records,
+        "offline_roundtrip_exempt": offline_records,
         "skipped_lines": skipped_lines,
         "dropped_by_defense": dict(failure_counts.most_common()),
         "dropped_by_task": dict(task_counts.most_common()),

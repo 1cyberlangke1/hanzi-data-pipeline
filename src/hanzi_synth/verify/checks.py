@@ -36,7 +36,9 @@ _MATCH_IGNORE = " \t\u3000、，,·．./／|｜"
 _NUM_RE = re.compile(r"\d+")
 
 # 汉字码位区间（含扩展 A/B 及以上）：用来判「题干是不是中文自然语言」。
-# 程序侧文本一律英文，所以英文题干 / 原样抄回的载荷必然一个汉字都没有，一抓一个准。
+# 判的是「题干里一个汉字都没有」这件事实——整段用英文作答的产出必然一个汉字都没有，一抓一个准。
+# 程序侧文本已改成中文，「照抄出题说明」不再由这条拦：出题说明是名词性短语、不是问句，
+# 交给 L4.6 往返检验的 `is_question` 判（见 `llm/roundtrip.py`）。
 _CJK_RANGES: tuple[tuple[int, int], ...] = (
     (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF),
     (0x20000, 0x2FFFF), (0x30000, 0x3FFFF),
@@ -65,23 +67,53 @@ _STRUCTURE_WORDS: tuple[str, ...] = tuple(sorted(set(IDC_LABELS.values())))
 # 判据是**子串比对**，判的是「产出里有没有出现这些说法」这件事实，与 `stem_is_chinese` 同类；
 # 它不是措辞规则表——不规定该怎么写，只挡下这些**不该出现在读者视野里**的词。
 _INTERNAL_TERMS: tuple[str, ...] = (
-    "题干", "载荷", "槽位", "校验器", "本题", "题目要求", "提供的", "必现串",
-    "payload", "facts", "instruction", "IDS",
+    "题干", "题目", "载荷", "槽位", "校验器", "本题", "题目要求", "提供的", "必现串",
+    "解析", "payload", "facts", "instruction", "IDS",
+    # 指代「一份并不存在的资料 / 出题过程」的说法。读者手上只有这道题本身，写出「根据资料」
+    # 就是把出题人视角的话漏给了读者；实测全量 710,655 条里有 27 条这样（26 条出自加规范之前的
+    # 旧提示词、1 条是当前提示词仍在漏），**全都在解析里**——机械闸门原先只认「提供的」这一类，
+    # 于是「根据资料 / 根据给定 / 资料显示」整类漏网。这几条判据与 `stem_is_chinese` 同类：
+    # 只判「产出里有没有出现这种说法」这件事实，不规定该怎么写。
+    "根据资料", "根据给定", "根据上述", "据资料", "资料显示", "此题", "本题目",
+    # 书名号形态的引用（「出自《中华字海》」「收录于《康熙字典》」）。判据仍是子串比对；题干里
+    # 本来就点了书名的题型（T6 问页码）不受影响——它的题干里带着同一个书名，命中的是**引用框架**
+    # 而不是书名本身，而 T6 的骨架不写框架（实测离线 707,551 条零命中）。
+    "出自《", "收录于《", "见于《",
+    # 引用框架的第二类漏网（实测 `llm_semantic.jsonl` 3,467 条里 900+ 条）：2B 把「出处」写进产出，
+    # 形态远不止 `出自《` 一种——「根据《中华字海》的释义」「据中华字海的记载」「康熙字典中记载」
+    # 「在《集韵》里」「说文解字说」。判据仍是**引用框架 / 书名**，不是「该怎么写」：
+    # 下面每一条都在离线 707,551 条上量过命中 0（`字海` / `中华` / `在《` 命中 32,256 / 32,256 / 15,707
+    # 条，**全是 T6 问页码**——它的题干本来就点着书名，所以那三个词不进表）。
+    "据《", "按《", "按照《", "根据《", "中《", "见《",
+    "据中华", "根据中华",
+    "康熙", "字典", "集韵", "直音篇", "说文",
 )
 
-# 裁判否决 / 往返检验否决回灌给措辞模型时的反馈名。两条闸门分开写：
-# 失败原因要能在 rejects 里一眼分开，否则「裁判说不好」和「读者答不出答案」会被混成一类。
+#
+# 占位符记号：程序给生僻字发的代号（`[[1]]`），回填发生在措辞之后——回填表里没有的记号（模型
+# 自己造出来的）没有任何东西能把它换掉，会原样进数据集。实测把示范写进对话轮次时，2B 会照着
+# 示范的形状在句尾多补一句 `[[1]]、[[2]]`；改掉示范形状后仍要有一道闸门兜底。
+_PLACEHOLDER_RE = re.compile(r"\[\[\d+\]\]")
+
+# 两条闸门的名字，**只进 rejects / attempt-stats**（给人看）。两条分开写：
+# 失败原因要能一眼分开，否则「裁判说不好」和「读者答不出答案」会被混成一类。
+# 回灌给措辞模型的那份**不带这两个名字**（见 `pipeline/run.py::_roundtrip_feedback`）——
+# 闸门名对模型毫无用处，只是塞进上下文的行话。
 JUDGE_FEEDBACK_KEY = "裁判否决"
 ROUNDTRIP_FEEDBACK_KEY = "往返检验否决"
 
-# 裁判的四条判据：裁判 system prompt 与措辞提示词都从这里生成，避免两边各写一份而漂移。
+# 裁判的五条判据：裁判 system prompt 与措辞提示词都从这里生成，避免两边各写一份而漂移。
+# 合成的是中文数据，判据也一律中文——英文判据要多一道翻译，2B 会译错（真机把 `reading`
+# 译成「阅读」），而且译错的词会直接进产出。
 JUDGE_CRITERIA: tuple[tuple[str, str], ...] = (
-    ("self_sufficient", "自足：读者只读 `stem` 就明白要回答什么、问的是哪个字或哪一项，识别条件都在 "
-                        "`stem` 里；反向题（靠释义与读音问字形）**不要求 `stem` 写出答案本身**，识别条件够就行"),
-    ("unambiguous", "无歧义：按 `stem` 给出的条件，读者能定出唯一一个答案；"
-                    "反向题里被隐藏的那个字**不算歧义**——识别条件唯一即可"),
-    ("explanation_clear", "解析说清：`explanation` 真的把答案说出来，且与答案字段一致"),
-    ("asks_a_question", "像一道题：`stem` 真的在提问或给出作答要求；只是把一条信息陈述出来不算"),
+    ("self_sufficient", "自足：只读题干，读者就知道要答什么、问的是哪个字或哪样东西——"
+                        "全部识别条件都写在题干里。反向题（给出读音与释义、问字形）不必把答案"
+                        "本身写出来，识别条件给够就行。"),
+    ("unambiguous", "无歧义：题干给出的条件唯一确定一个答案。反向题里被隐藏的那个字不算歧义。"),
+    ("explanation_clear", "解析真的说出了答案，并且与答案一致。"),
+    ("asks_a_question", "题干真的在向读者提问或给出作答要求；只陈述一条信息不算提问。"),
+    ("natural_wording", "措辞是中国人真会说的话：不要字典腔、不要生造词、不要罗列腔，"
+                        "也不要出现谈论写作要求、字段、给定清单或题目本身的句子。"),
 )
 
 
@@ -99,7 +131,7 @@ def _is_cjk(char: str) -> bool:
 
 
 def _cjk_count(text: str) -> int:
-    """输入：任意文本。输出：其中汉字的个数。预期：供「题干是中文自然语言」这条闸门用。"""
+    """输入：任意文本。输出：其中汉字的个数。预期：供「题干是中文自然语言」与「解析不是光秃答案」两条闸门用。"""
     return sum(1 for char in (text or "") if _is_cjk(char))
 
 
@@ -136,6 +168,27 @@ def _missing_in_stem(stem: str, needles: "Sequence[str]") -> list[str]:
         for item in needles
         if normalize_for_match(str(item)) and normalize_for_match(str(item)) not in stem_norm
     ]
+
+
+def answer_leak_limit(spec: TaskSpec, item: str) -> int:
+    """输入：TaskSpec + 一个答案串（主答案或别名）。输出：它在题干里允许出现的次数（0 或 1）。
+
+    预期：**渲染层与闸门共用这一份判据**——`visible_subject` / `must_contain` / `options` 里的串
+          是读者本来就要在题干里看到的（要从候选里选、要看见问的是哪个字），答案在其中时允许出现
+          1 次，其余 0 次。两处算法一旦分叉，渲染就会交出注定被闸门拒掉的句子：实测全量有 38 条
+          (题型, 字) 因此一条数据都出不来，其中 32 条只要换一条不撞答案的句式就能出
+          （`synthesis/out/probe_leak_rescue.py`）。判据比的是**归一化后**的串（`normalize_for_match`
+          会去掉空白与列举分隔符，T15 的「E3 90 8B」这类带空格的写法靠它才比得准）。
+    """
+    needle = normalize_for_match(str(item))
+    if not needle:
+        return 0
+    declared = {
+        normalize_for_match(str(candidate))
+        for candidate in (spec.visible_subject, *spec.must_contain, *spec.options)
+        if str(candidate)
+    }
+    return 1 if needle in declared else 0
 
 
 def leaked_field_names(spec: TaskSpec, text: str) -> list[str]:
@@ -261,12 +314,18 @@ class Verification:
     not_truncated: bool = False
     stem_is_chinese: bool = False
     no_source_copy: bool = False
+    no_instruction_copy: bool = False
     no_internal_terms: bool = False
     no_field_names: bool = False
     no_foreign_words: bool = False
     no_marker_enumeration: bool = False
     no_escape_artifacts: bool = False
+    no_placeholder_leak: bool = False
+    explanation_is_prose: bool = False
     failures: tuple[str, ...] = ()
+    # 同一批失败的**模型侧**说法，只回灌给措辞模型（`pipeline/run.py` 的 reflexion）。
+    # 中文，且刻意用 `_INTERNAL_TERMS` 里的词（题干 / 载荷 / 必现串）——模型把反馈原文抄进产出，
+    # `no_internal_terms` 当场拦下。与 `failures` 同序同长。
     notes: tuple[str, ...] = ()
     # 答案核验的**语义那一半**的痕迹：`answer_in_explanation` 是子串比对，判得了「解析里有没有那串
     # 字」、判不了「解析说的是不是那个答案」，所以它只做快速通过，过不了才问 LLM（见
@@ -294,11 +353,14 @@ class Verification:
                 self.not_truncated,
                 self.stem_is_chinese,
                 self.no_source_copy,
+                self.no_instruction_copy,
                 self.no_internal_terms,
                 self.no_field_names,
                 self.no_foreign_words,
                 self.no_marker_enumeration,
                 self.no_escape_artifacts,
+                self.no_placeholder_leak,
+                self.explanation_is_prose,
             )
         ) else "C"
 
@@ -318,11 +380,14 @@ class Verification:
             "not_truncated": self.not_truncated,
             "stem_is_chinese": self.stem_is_chinese,
             "no_source_copy": self.no_source_copy,
+            "no_instruction_copy": self.no_instruction_copy,
             "no_internal_terms": self.no_internal_terms,
             "no_field_names": self.no_field_names,
             "no_foreign_words": self.no_foreign_words,
             "no_marker_enumeration": self.no_marker_enumeration,
             "no_escape_artifacts": self.no_escape_artifacts,
+            "no_placeholder_leak": self.no_placeholder_leak,
+            "explanation_is_prose": self.explanation_is_prose,
             "tier": self.tier,
             "failures": list(self.failures),
             "notes": list(self.notes),
@@ -333,10 +398,10 @@ class Verification:
 def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     """输入：TaskSpec 与 L3 产出。输出：Verification。
     预期：任一条不过就记进 failures，绝不因为「只差一点点」而放行。
-          `failures` 是**中文**的，给人看（rejects / attempt-stats）；`notes` 是同一批失败的
-          **英文**说法，只用于回灌给措辞模型——实测把中文失败原因回灌，2B 会把它整段抄进题干
-          （「题干列出了…」「请在提供的汉字中找出…」都来自上一轮的中文反馈）。两份在同一个
-          地方同源生成，不会漂移。
+          `failures` 给人看（rejects / attempt-stats），`notes` 回灌给措辞模型；两份在同一个
+          地方同源生成，同序同长，不会漂移。两份**都是中文**：合成的是中文数据，中英混排会让
+          2B 多一道翻译并译错。`notes` 刻意用闸门会拦的词（题干 / 载荷 / 必现串）——模型把反馈
+          抄进产出即被 `no_internal_terms` 拦下，抄不回数据集。
     """
     failures: list[str] = []
     notes: list[str] = []
@@ -344,7 +409,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     schema_ok = bool(verbalized.ok and verbalized.stem and isinstance(verbalized.explanation, str))
     if not schema_ok:
         failures.append("schema: 槽位缺失或为空")
-        notes.append("The reply was not a JSON object with non-empty stem and explanation slots.")
+        notes.append("回的不是一个带非空题干与解析的 JSON 对象。两个槽位都要填上。")
         return Verification(schema=False, failures=tuple(failures), notes=tuple(notes))
 
     stem, explanation = verbalized.stem, verbalized.explanation
@@ -353,7 +418,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     no_empty_slot = bool(stem.strip() and explanation.strip())
     if not no_empty_slot:
         failures.append("no_empty_slot: 题干或解析是空白")
-        notes.append("The stem or the explanation is blank. Fill both.")
+        notes.append("题干或解析是空白。两个都要写。")
 
     # 2. 解析必须原样说出答案：答案由代码定死，解析说不出它，这道题就没有解。
     explanation_norm = normalize_for_match(explanation)
@@ -363,7 +428,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     )
     if not answer_in_explanation:
         failures.append(f"answer_in_explanation: 解析里没有出现答案 {spec.answer!r}")
-        notes.append(f"The explanation never states the answer {spec.answer!r}. Write it in.")
+        notes.append(f"解析里没有说出答案「{spec.answer}」。把它写进解析。")
 
     # 3. 题干不得泄露答案。上限按「题干本来就得写出它几次」算：**候选名单里的字**（选择题的
     #    `options`、题干必现串 `visible_subject` / `must_contain`）允许出现**一次**——那是读者
@@ -371,17 +436,12 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     #    出现两次以上则无论哪种情况都算泄露：实测 T10 写「其中只有「㐀」的部首不是「風」，
     #    因此应选出「㐀」」——题干连解析一起给了，读者照抄就算答对。
     stem_norm = normalize_for_match(stem)
-    required = {
-        normalize_for_match(str(item))
-        for item in (spec.visible_subject, *spec.must_contain, *spec.options)
-        if str(item)
-    }
     no_answer_leak = True
     for item in spec.accepted:
         needle = normalize_for_match(str(item))
         if not needle:
             continue
-        leak_limit = 1 if needle in required else 0
+        leak_limit = answer_leak_limit(spec, item)
         hits = stem_norm.count(needle)
         if hits <= leak_limit:
             continue
@@ -391,11 +451,11 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         )
         if spec.options:
             notes.append(
-                f"The stem mentions the answer {item!r} {hits} times. List every candidate exactly "
-                "once and never say which one is correct - the stem must not contain the answer."
+                f"题干里出现了 {hits} 次答案「{item}」。每个候选各列一次，别说哪个是对的"
+                "——题干里不能有答案。"
             )
         else:
-            notes.append(f"The stem gives the answer {item!r} away. Ask the question without it.")
+            notes.append(f"题干把答案「{item}」直接说出来了。问这件事，但别把答案写出来。")
         break
 
     # 4a. 必现串：`visible_subject`（问哪个字）+ `must_contain`（题型声明的其它识别条件，
@@ -405,9 +465,8 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if missing_subject:
         failures.append(f"subject_in_stem: 题干里没有写出必现串 {missing_subject}")
         notes.append(
-            f"The stem does not contain these required strings: {missing_subject}. Every string "
-            "listed in stem_must_contain has to appear in the stem verbatim; never replace one of "
-            "them with a reference such as 'the reading' or 'the parts above'."
+            f"题干里没有写出必现串 {missing_subject}。这些串必须原样出现在题干里，"
+            "不许用「这个读音」「上边的部件」这类指代代替。"
         )
 
     # 4b. 选择题：候选必须逐个出现在题干里。**这条不能省**——往返检验的载荷里带着 options，
@@ -416,8 +475,8 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if not options_listed:
         failures.append(f"options_listed: 题干里没有列出候选 {_missing_in_stem(stem, spec.options)}")
         notes.append(
-            f"The stem does not list the candidates {_missing_in_stem(stem, spec.options)}. "
-            "Write every candidate into the stem so the reader has something to choose from."
+            f"题干里没有列出候选 {_missing_in_stem(stem, spec.options)}。"
+            "每个候选都要写进题干，读者才有得选。"
         )
 
     # 4c. 题干问的必须是答案那件事：命中 `stem_asks_any` 里的任一种说法即可。
@@ -426,7 +485,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if not stem_asks:
         failures.append(f"stem_asks: 题干没有问「{spec.stem_asks_any[0]}」那件事")
         notes.append(
-            f"The stem does not ask for {spec.stem_asks_any[0]!r}. Ask for that, not for something else."
+            f"题干没有问「{spec.stem_asks_any[0]}」这件事。问这个，别问别的。"
         )
 
     # 4d. 隐藏主语（反向题的那个字）：题干写出它，题目就退化成查表题——读者不用看释义。
@@ -434,8 +493,8 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if not no_hidden_subject:
         failures.append(f"no_hidden_subject: 题干里写出了隐藏主语 {spec.hidden_subject!r}")
         notes.append(
-            f"The stem writes out {spec.hidden_subject!r}, which has to stay hidden. Let the reader "
-            "identify the character from the conditions instead of naming it."
+            f"题干把该藏起来的那个字「{spec.hidden_subject}」写出来了。让读者从条件里认出它，"
+            "别直接点名。"
         )
 
     # 4e. 字形结构：声明了 `structure_words` 的题，题干里一个结构词都不许出现（把答案那棵树
@@ -446,14 +505,13 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         if leaked:
             structure_words = False
             failures.append(f"structure_words: 题干里出现了字形结构词 {leaked}")
-            notes.append(f"The stem uses structure words {leaked}; they give the answer away. Remove them.")
+            notes.append(f"题干里出现了字形结构词 {leaked}，等于把答案说出来了。删掉。")
         invented = [word for word in _STRUCTURE_WORDS if word in explanation and word not in spec.structure_words]
         if invented:
             structure_words = False
             failures.append(f"structure_words: 解析里的结构词 {invented} 不是答案用到的 {list(spec.structure_words)}")
             notes.append(
-                f"The explanation uses structure words {invented} that the answer does not use. "
-                f"Only {list(spec.structure_words)} may appear."
+                f"解析里出现了答案用不到的结构词 {invented}。只能出现 {list(spec.structure_words)}。"
             )
 
     # 5. 数字必须来自载荷：产出里出现载荷没有的阿拉伯数字 = 凭空造数（笔画数、码位最容易编）。
@@ -462,20 +520,21 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     numbers_from_facts = not invented
     if invented:
         failures.append(f"numbers_from_facts: 正文里出现了载荷中没有的数字 {invented}")
-        notes.append(f"The text contains numbers that are not in the facts: {invented}. Use only the given ones.")
+        notes.append(f"正文里出现了载荷中没有的数字 {invented}。只能用载荷里给的那些。")
 
     # 6. 截断：`finish_reason == 'length'` 说明这次产出被按长度砍断，不是完整的一句话。
     not_truncated = verbalized.finish_reason != "length"
     if not not_truncated:
         failures.append("not_truncated: 产出被按长度截断")
-        notes.append("The reply was cut off before it finished. Keep both slots short enough to complete.")
+        notes.append("产出被截断了，没写完。两个槽位都写短一点，保证能写完。")
 
-    # 7. 题干必须是**中文自然语言**：程序侧文本一律英文，题干里一个汉字都没有，只可能是
-    #    模型把载荷原样抄了回来（或整段用英文作答）——两种都不是能发给读者的数据。
+    # 7. 题干必须是**中文自然语言**：判据是「题干里一个汉字都没有」这件事实——整段用英文作答的
+    #    产出必然一个汉字都没有，一抓一个准。（程序侧文本已改成中文，「照抄出题说明」不再由这条
+    #    拦：出题说明是名词性短语、不是问句，交给 L4.6 往返检验的 `is_question` 判。）
     stem_is_chinese = _cjk_count(stem) > 0
     if not stem_is_chinese:
         failures.append("stem_is_chinese: 题干里没有汉字（不是中文自然语言）")
-        notes.append("The stem contains no Chinese characters. Write it as Chinese prose.")
+        notes.append("题干里一个汉字都没有。用中文把这道题写出来。")
 
     # 8. 题干不得照抄释义原文：释义是**素材**，不是可以直接搬进数据的文本（照抄既侵权，
     #    也等于没有改写）。只抓连续 `_SOURCE_COPY_RUN` 个汉字及以上的照抄，正常改写不会被误杀。
@@ -487,9 +546,25 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         failures.append(
             f"no_source_copy: 题干与释义原文连续相同超过 {_SOURCE_COPY_RUN - 1} 个汉字（照抄释义）"
         )
+        # 这是 21 个闸门里**唯一**漏了模型侧说法的一条：漏了它，`_run_one` 只能把带闸门名的
+        # `failures` 原文回灌给模型（实测 T13 因此反复在同一处摔，129 条 rejects 全是这条）。
         notes.append(
-            f"The stem copies more than {_SOURCE_COPY_RUN - 1} consecutive characters from the meaning "
-            "source. Put the same content in your own words."
+            "题干把释义原文整段搬了过来，读起来像照抄字典。释义只是素材：意思要讲全，"
+            "但得用你自己的话换个说法，别连续照抄原句。"
+        )
+
+    # 8b. 题干不得**原样照搬**程序侧的题目说明：说明是「要问什么」的机读描述（「「㐀」的读音」），
+    #     不是写给读者的话，逐字相同 = 模型没改写（主人原话：「禁止直接抄写字段的原始内容」）。
+    #     判据是**归一化后逐字相同**，不是包含——正常改写（「「㐀」的读音是什么？」）比说明长，
+    #     不会被误杀（离线 705,175 条模板题干实测 0 条与说明相同；语义池实测 23/1,321 条相同）。
+    no_instruction_copy = normalize_for_match(stem) != normalize_for_match(
+        getattr(spec, "instruction", "") or ""
+    )
+    if not no_instruction_copy:
+        failures.append("no_instruction_copy: 题干与题目说明逐字相同（照抄说明，没有改写）")
+        notes.append(
+            "题干是把题目说明原样搬过来的，读者读到的不是一句问话。把说明当成「要问什么」，"
+            "用一句完整的话把它问出来。"
         )
 
     # 9. 产出不得出现程序侧的说法：题干或解析里冒出「题干」「载荷」「槽位」「校验器」「IDS」
@@ -503,9 +578,8 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         # **不把那些词抄进反馈**：把泄漏的词原样回灌，2B 会再抄一遍（实测第二轮照样写
         # 「根据提供的信息」）。只说「删掉指代出题过程的说法、直接陈述事实」，不点名。
         notes.append(
-            "The text uses wording that belongs to the writing instructions, not to the question. "
-            "Delete every phrase that talks about instructions, fields or a provided list, and state "
-            "the fact itself in one plain Chinese sentence."
+            "正文里混进了出题说明的说法，不是写给读者看的话。把所有指代出题过程、字段、"
+            "「提供的」清单的说法删掉，直接用一句平实的中文把事实说出来。"
         )
 
     # 10. 载荷的**键名**不得出现在正文里：键名是程序侧的英文标识符（`stroke_total` / `codepoint` /
@@ -517,8 +591,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if leaked_fields:
         failures.append(f"no_field_names: 正文里出现了载荷键名 {leaked_fields}")
         notes.append(
-            f"The text contains payload field names {leaked_fields}. Write the value each field holds, "
-            "never the field name itself."
+            f"正文里出现了载荷的键名 {leaked_fields}。要写的是键对应的值，不是键名本身。"
         )
 
     # 10b. 题干不许把 `stem_asks_any` 里的说法**连成一串**念出来：那张表是程序侧的判据词表，
@@ -530,8 +603,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if not no_marker_enumeration:
         failures.append(f"no_marker_enumeration: 题干把判据词连成一串念了出来 {marker_words}")
         notes.append(
-            "The stem strings several ways of asking the same thing together. Ask it once, in your "
-            "own words, and leave the list out."
+            "题干把好几种问同一件事的说法连在一起念了出来。用自己的话说一次，那张清单不要念。"
         )
 
     # 11. 正文必须是中文散文：夹进来的英文词要么是载荷里的数据（`UTF-8` / `xi3` / `E3 90 80`），
@@ -541,8 +613,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if stray_words:
         failures.append(f"no_foreign_words: 正文里出现了载荷中没有的英文词 {stray_words}")
         notes.append(
-            f"The text contains English words that are not in the given data: {stray_words}. "
-            "Write those parts in Chinese; keep only the values that were given to you."
+            f"正文里出现了载荷里没有的英文词 {stray_words}。这些部分用中文写，只保留载荷给的那些值。"
         )
 
     # 12. 正文里不得有转义残留：实测 2B 会吐出字面的 `\n`（JSON 里写成 `\\n`），
@@ -552,8 +623,35 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     if not no_escape_artifacts:
         failures.append("no_escape_artifacts: 正文里出现了转义残留（字面的反斜杠）")
         notes.append(
-            "The text contains a literal backslash (an escaped newline). Write plain one-line prose "
-            "with no escape characters."
+            "正文里有字面的反斜杠（被转义的换行）。写成一行平实的散文，不要转义字符。"
+        )
+
+    # 13. 产出里不得残留占位符记号：`[[1]]` 是程序给生僻字发的代号，回填发生在措辞之后；
+    #     回填表里没有的记号没有任何东西能把它换掉，会原样进数据集。判据是子串比对（记号
+    #     全是 ASCII 括号加数字，中文散文里出现即泄漏），与 `stem_is_chinese` 同类。
+    leaked_placeholders = sorted(set(_PLACEHOLDER_RE.findall(f"{stem}\n{explanation}")))
+    no_placeholder_leak = not leaked_placeholders
+    if leaked_placeholders:
+        failures.append(f"no_placeholder_leak: 产出里残留占位符记号 {leaked_placeholders}")
+        notes.append(
+            "正文里残留了 [[1]] 这类记号，那是程序给字发的代号。写出字本身，或者整个删掉。"
+        )
+
+    # 14. 解析不能只是**光秃答案**：`answer_in_explanation` 只查「答案串在不在解析里」，光秃
+    #     答案天然在——真机实测 T9 回一个「七」就发布了（T3 回「⿱卝一」同理）。数据要的是**自然
+    #     语言**，所以解析里除了答案本身，还得有中文说明。判据与其它闸门同类（子串比对），不规定
+    #     该怎么措辞。全量离线数据 739,005 条复查：**0 条**会因此被判 C（`scan_bare_answer.py`）。
+    stripped_explanation = explanation_norm
+    for item in (spec.answer, *spec.accepted):
+        needle = normalize_for_match(str(item))
+        if needle:
+            stripped_explanation = stripped_explanation.replace(needle, "")
+    explanation_is_prose = _cjk_count(stripped_explanation) > 0
+    if not explanation_is_prose:
+        failures.append("explanation_is_prose: 解析只是光秃答案，没有一句说明")
+        notes.append(
+            f"解析里除了答案「{spec.answer}」本身，一个字的中文说明都没有。"
+            "用一句完整的话把这件事说清楚。"
         )
 
     return Verification(
@@ -570,11 +668,14 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         not_truncated=not_truncated,
         stem_is_chinese=stem_is_chinese,
         no_source_copy=no_source_copy,
+        no_instruction_copy=no_instruction_copy,
         no_internal_terms=no_internal_terms,
         no_field_names=no_field_names,
         no_foreign_words=no_foreign_words,
         no_marker_enumeration=no_marker_enumeration,
         no_escape_artifacts=no_escape_artifacts,
+        no_placeholder_leak=no_placeholder_leak,
+        explanation_is_prose=explanation_is_prose,
         failures=tuple(failures),
         notes=tuple(notes),
     )

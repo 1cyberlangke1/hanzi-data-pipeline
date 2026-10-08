@@ -202,8 +202,9 @@ def build_constraint(
     )
     return TaskSpec(
         task_id="T8_constraint",
+        payload_facts=("conditions",),
         instruction=(
-            "Ask the reader which character satisfies every condition stated in the stem."
+            "同时满足列出的全部条件的那个字"
         ),
         facts={**facts, "conditions": description, "answer_zi": character.zi},
         answer=character.zi,
@@ -270,15 +271,24 @@ def build_component_chain(
     if not final_steps:
         return None
     final = final_steps[rng.randrange(len(final_steps))]
-    if not final.component or final.component in named:
-        return None  # 答案与题干里出现过的字撞车 = 泄露
+    # 泄露判据必须按**子串**比，不能按相等比：题干为了写出路径，必然原样带上每个位置词
+    # （「右边」「中」这类），而答案可能是位置词的子串。实测有 (路径含「右边」, 答案「右」)
+    # 与 (路径含「中」, 答案「中华字海」) 两种组合——无论模型怎么写，题干都会同时带上
+    # 路径词与答案，被判泄露后反复回炉，永远出不来。
+    tokens = [*named, *path, final.label]
+    if not final.component or any(
+        final.component in token or token in final.component for token in tokens if token
+    ):
+        return None  # 答案与题干里出现过的字/位置词撞车 = 泄露
     path.append(final.label)
 
     return TaskSpec(
         task_id="T9_component_chain",
+        payload_facts=("start_zi", "path"),
         instruction=(
-            f"Ask the reader which character sits at the innermost end of the position chain, "
-            f"starting from 「{character.zi}」."
+            # 位置链是题干**必须出现**的串（`must_contain`）：只写「沿位置链」2B 就不写具体
+            # 位置词，读者无从判断走哪一层，这道题不可作答（实测 0/2 → 2/2，probe_weave.jsonl）。
+            f"从「{character.zi}」出发，沿 {'、'.join(path)} 这条位置链走到最里层的那个部件"
         ),
         facts={"start_zi": character.zi, "path": path, "depth": difficulty.hops},
         answer=final.component,
@@ -337,8 +347,12 @@ def build_odd_one_out(
     rng.shuffle(options)
     return TaskSpec(
         task_id="T10_odd_one_out",
+        payload_facts=("other_options_radical",),
         instruction=(
-            "Ask the reader which of the listed candidates has a radical different from the others."
+            # 候选**写进说明**：闸门要求题干逐个列出候选（读者要有得选），而只写「候选里」
+            # 2B 一个都不列（实测 0/2 → 2/2，probe_weave.jsonl）。生僻字由 `payload_for`
+            # 统一换成占位符，模型不必自己敲。
+            f"{'、'.join(options)} 里部首与其它几个不同的那个字"
         ),
         # 键名必须自解释：`radical` 是**其它三个候选共有**的部首，答案字的部首与它不同。
         # 旧键名 `radical` 有歧义，实测 2B 据此写出自相矛盾的解析
@@ -392,12 +406,12 @@ def build_stroke_extreme(
     options = [character.zi, *(c.zi for c in others)]
     rng.shuffle(options)
     comparator = "最多" if direction == "most" else "最少"
-    comparator_en = "most" if direction == "most" else "fewest"
     return TaskSpec(
         task_id="T11_stroke_extreme",
+        payload_facts=("strokes",),
         instruction=(
-            f"Ask the reader which of the listed candidates has the {comparator_en} strokes in "
-            "total."
+            # 候选写进说明（同 T10 的理由）：只写「候选里」2B 就不列候选，题干没有可选项。
+            f"{'、'.join(options)} 里总笔画数{comparator}的那个字"
         ),
         facts={
             "direction": direction,
@@ -508,9 +522,9 @@ def build_ids_transform(
 
     return TaskSpec(
         task_id="T12_ids_transform",
+        payload_facts=("start_zi", "edits"),
         instruction=(
-            f"Ask the reader which character results from applying the listed replacement steps, in "
-            f"order, to the starting character 「{character.zi}」."
+            f"从「{character.zi}」出发按列出的替换步骤依次执行后得到的那个字"
         ),
         facts={
             "start_zi": character.zi,

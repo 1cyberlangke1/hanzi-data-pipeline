@@ -17,7 +17,7 @@ from hanzi_synth.pipeline.difficulty import (
     target_facility,
     write_calibration,
 )
-from hanzi_synth.tasks.base import Difficulty
+from hanzi_synth.tasks.base import MIXED_LEVEL, Difficulty
 
 
 class TargetFacilityTests(unittest.TestCase):
@@ -42,8 +42,8 @@ class TargetFacilityTests(unittest.TestCase):
 class DifficultyNoteTests(unittest.TestCase):
     def test_branches_follow_the_task(self) -> None:
         """T8 的 K 用约束个数，其余题型用默认分支数。"""
-        self.assertEqual(branches_for("T8_constraint", Difficulty(constraints=3)), 3)
-        self.assertEqual(branches_for("T1_stroke_total", Difficulty(constraints=3)), DEFAULT_BRANCHES)
+        self.assertEqual(branches_for("T8_constraint", 3), 3)
+        self.assertEqual(branches_for("T1_stroke_total", 3), DEFAULT_BRANCHES)
 
     def test_only_hop_tasks_report_hops(self) -> None:
         """不消费 hops 的题型如实写 hops=1，不假装旋钮起作用了。"""
@@ -55,6 +55,16 @@ class DifficultyNoteTests(unittest.TestCase):
         """constraints 只对 T8 生效，其余题型写 None。"""
         self.assertEqual(difficulty_note("T8_constraint", Difficulty(constraints=2))["constraints"], 2)
         self.assertIsNone(difficulty_note("T9_component_chain", Difficulty(constraints=2))["constraints"])
+
+    def test_modes_are_recorded_so_sampling_is_visible(self) -> None:
+        """注记要能区分「配置就是这档」和「从 mixed 抽 / 退档来的」——否则看不出难度是抽样来的。"""
+        note = difficulty_note("T9_component_chain", Difficulty(hops=MIXED_LEVEL), resolved_hops=2)
+        self.assertEqual(note["hops"], 2)
+        self.assertEqual(note["hops_mode"], MIXED_LEVEL)
+        note = difficulty_note("T8_constraint", Difficulty(constraints=2), resolved_constraints=2)
+        self.assertEqual(note["constraints"], 2)
+        self.assertEqual(note["constraints_mode"], 2)
+        self.assertEqual(note["branches"], 2)
 
     def test_note_is_labelled_as_prior(self) -> None:
         """注记必须自称解析式先验，不能让人误以为这是实测标定。"""

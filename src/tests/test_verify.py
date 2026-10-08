@@ -94,7 +94,7 @@ class FactFidelityTests(unittest.TestCase):
             ),
         )
         note = dict(zip((item.split(":")[0] for item in result.failures), result.notes))["no_answer_leak"]
-        self.assertIn("exactly once", note)
+        self.assertIn("各列一次", note)
 
     def test_subject_must_appear_in_stem(self) -> None:
         """读者看不见是哪个字，就答不了题。"""
@@ -119,7 +119,7 @@ class FactFidelityTests(unittest.TestCase):
 
 class OutputFormTests(unittest.TestCase):
     def test_stem_must_be_chinese(self) -> None:
-        """程序侧文本一律英文；题干里一个汉字都没有，只可能是模型把载荷抄了回来。"""
+        """题干必须是中文自然语言；整段用英文作答的产出一个汉字都没有。"""
         result = verify(_spec(), _verbalized(stem="Ask the reader how it is pronounced."))
         self.assertFalse(result.stem_is_chinese)
         self.assertEqual(result.tier, "C")
@@ -137,12 +137,27 @@ class OutputFormTests(unittest.TestCase):
         self.assertFalse(result.not_truncated)
         self.assertEqual(result.tier, "C")
 
+    def test_copying_the_instruction_is_rejected(self) -> None:
+        """题干与程序侧 `instruction` 逐字相同 = 没改写（主人原话：禁止直接抄写字段的原始内容）。
+
+        预期：逐字相同判不合格；正常改写（说明后面接上「是什么？」）不误杀。
+        """
+        spec = _spec(instruction="「㐀」的读音")
+        copied = verify(spec, _verbalized(stem="「㐀」的读音"))
+        self.assertFalse(copied.no_instruction_copy)
+        self.assertEqual(len(copied.notes), len(copied.failures))
+        rewritten = verify(spec, _verbalized(stem="「㐀」的读音是什么？"))
+        self.assertTrue(rewritten.no_instruction_copy)
+
     def test_copying_the_meaning_source_is_rejected(self) -> None:
         """释义原文是**素材**：连续照抄十个汉字及以上判不合格，正常改写不误杀。"""
         source = "这个字表示一种古代的礼器名称用来盛放祭品"
         spec = _spec(facts={"meaning_source": source})
         copied = verify(spec, _verbalized(stem=f"「㐀」的读音是什么？{source}"))
         self.assertFalse(copied.no_source_copy)
+        # 被拒时模型必须拿到「换个说法」这句人话，而不是闸门名 + 判据说明
+        self.assertEqual(len(copied.notes), len(copied.failures))
+        self.assertTrue(any("照抄" in note for note in copied.notes), copied.notes)
         rewritten = verify(spec, _verbalized(stem="古代有一种用来盛放祭品的礼器，这个字指的就是它，它读什么？"))
         self.assertTrue(rewritten.no_source_copy)
 
@@ -164,17 +179,46 @@ class InternalTermsTests(unittest.TestCase):
         T16「请在提供的汉字中找出…」、T4「但题目要求用拼音标注为 xi3」。
         """
         for term in ("题干", "载荷", "槽位", "校验器", "必现串", "本题", "题目要求",
-                     "提供的汉字", "提供的资料", "IDS", "payload", "facts", "instruction"):
+                     "提供的汉字", "提供的资料", "IDS", "payload", "facts", "instruction",
+                     "根据资料", "根据给定", "资料显示"):
             with self.subTest(term=term):
                 result = verify(_spec(), _verbalized(stem=f"「㐀」的读音是什么？{term}"))
                 self.assertFalse(result.no_internal_terms, term)
                 self.assertEqual(result.tier, "C", term)
+
+    def test_source_citation_framing_in_explanation_is_rejected(self) -> None:
+        """解析里带「根据《…》/ 康熙字典 / 集韵」这类**引用框架** → 否决。
+
+        实测（`llm_semantic.jsonl` 3,467 条里 900+ 条）：2B 会把出处写进产出，
+        形态远不止 `出自《` 一种。判据是「产出里有没有出现这种说法」这件事实，
+        不是「该怎么写」——所以它挡得住，也不会把正常解释误伤。
+        """
+        for phrase in ("根据《中华字海》的释义，「㐀」读作 qiu1。",
+                       "据中华字海的记载，「㐀」读作 qiu1。",
+                       "康熙字典中记载，「㐀」读作 qiu1。",
+                       "「㐀」在《集韵》里读作 qiu1。",
+                       "《说文》说「㐀」读作 qiu1。"):
+            result = verify(_spec(), _verbalized(explanation=phrase))
+            self.assertFalse(result.no_internal_terms, phrase)
 
     def test_program_side_wording_in_explanation_is_rejected(self) -> None:
         """解析里同样不许出现——产出是给读者的，不是给程序的。"""
         result = verify(_spec(), _verbalized(explanation="「㐀」读作 qiu1，这是本题的题干。"))
         self.assertFalse(result.no_internal_terms)
         self.assertEqual(result.tier, "C")
+
+    def test_missing_source_wording_in_explanation_is_rejected(self) -> None:
+        """解析里写「根据资料 / 根据给定」= 把出题人视角的话漏给读者：读者手上没有那份资料。
+
+        实测全量 710,655 条里 27 条这样，全在解析里（旧提示词 26 条、当前提示词 1 条）——
+        机械闸门原先只认「提供的」这一类，整类漏网。
+        """
+        for phrase in ("根据资料，「㐀」读作 qiu1。", "根据给定的信息，这个字读 qiu1。",
+                       "资料显示，「㐀」读作 qiu1。"):
+            with self.subTest(phrase=phrase):
+                result = verify(_spec(), _verbalized(explanation=phrase))
+                self.assertFalse(result.no_internal_terms, phrase)
+                self.assertEqual(result.tier, "C", phrase)
 
     def test_abbreviation_case_is_ignored(self) -> None:
         """大小写都算：写成 ids 一样是程序侧的说法。"""
@@ -204,8 +248,8 @@ class FieldNameTests(unittest.TestCase):
         self.assertEqual(result.tier, "A")
 
     def test_payload_field_name_is_rejected(self) -> None:
-        """载荷字段名（`stem_must_contain` 这类）同样不得进正文——它比 facts 的键更不像人话。"""
-        result = verify(_spec(), _verbalized(explanation="按 stem_must_contain 的要求，「㐀」读作 qiu1。"))
+        """载荷字段名（`instruction` 这类）同样不得进正文——它比 facts 的键更不像人话。"""
+        result = verify(_spec(), _verbalized(explanation="按 instruction 的要求，「㐀」读作 qiu1。"))
         self.assertFalse(result.no_field_names)
         self.assertEqual(result.tier, "C")
 
@@ -287,25 +331,117 @@ class EscapeArtifactTests(unittest.TestCase):
         self.assertTrue(result.no_escape_artifacts)
 
 
-class FeedbackNoteTests(unittest.TestCase):
-    """`notes` 是 failures 的**英文**说法，只回灌给措辞模型。
+class PlaceholderLeakTests(unittest.TestCase):
+    """产出里不得残留 `[[1]]` 这类占位符记号：回填表里没有对应项的记号没有任何东西能换掉它。
 
-    预期：与 failures 一一对应（同序）；模板是英文——中文失败原因回灌会被 2B 整段抄进题干
-          （实测「题干列出了…」「请在提供的汉字中找出…」都来自上一轮的中文反馈）。
-          提示里可以出现载荷里的汉字（缺的串、答案），那是数据不是模板。
+    预期：记号出现在题干或解析里都判 C 级；正常散文不受影响。
+    """
+
+    def test_stray_placeholder_in_stem_is_rejected(self) -> None:
+        result = verify(_spec(), _verbalized(stem="「㐀」怎么读？[[1]]、[[2]]。"))
+        self.assertFalse(result.no_placeholder_leak)
+        self.assertEqual(result.tier, "C")
+
+    def test_stray_placeholder_in_explanation_is_rejected(self) -> None:
+        result = verify(_spec(), _verbalized(explanation="答案是 [[3]]。"))
+        self.assertFalse(result.no_placeholder_leak)
+
+    def test_plain_prose_passes(self) -> None:
+        result = verify(_spec(), _verbalized())
+        self.assertTrue(result.no_placeholder_leak)
+        self.assertEqual(result.tier, "A")
+
+
+class ExplanationProseTests(unittest.TestCase):
+    """解析必须是**一句说明**，不能只是光秃答案。
+
+    真机实测（本地 2B，`run --limit 4`）：T9 的解析就回了一个「七」——`answer_in_explanation`
+    只查「答案串在不在解析里」，光秃答案天然在，于是裸值直接进了数据集。
+    """
+
+    def test_bare_answer_is_rejected(self) -> None:
+        """解析只有答案本身（裸值）→ 判 C。"""
+        result = verify(_spec(), _verbalized(explanation="qiu1"))
+        self.assertFalse(result.explanation_is_prose)
+        self.assertEqual(result.tier, "C")
+
+    def test_answer_plus_punctuation_is_still_bare(self) -> None:
+        """答案 + 标点还是裸值，不是说明。"""
+        result = verify(_spec(), _verbalized(explanation="qiu1。"))
+        self.assertFalse(result.explanation_is_prose)
+
+    def test_answer_stated_in_a_sentence_passes(self) -> None:
+        """一句完整的话里说出答案 → 过（这是默认夹具，本来就必须过）。"""
+        self.assertTrue(verify(_spec(), _verbalized()).explanation_is_prose)
+
+    def test_minimal_wrapper_around_the_answer_passes(self) -> None:
+        """边界：只有答案 + 一层包装词（「答案是「qiu1」。」）也算说明——这条闸门判的是
+        「除了答案还有没有话」，不判那句话写得好不好（好不好是 L4.6 往返检验的事）。"""
+        result = verify(_spec(), _verbalized(explanation="答案是「qiu1」。"))
+        self.assertTrue(result.explanation_is_prose)
+
+    def test_every_alias_counts_as_the_answer(self) -> None:
+        """别名也算答案本身：别名裸值同样判 C，别靠换个写法绕过这条。"""
+        spec = _spec(answer="qiu1", answer_aliases=("qiú",))
+        self.assertFalse(verify(spec, _verbalized(explanation="qiú")).explanation_is_prose)
+
+
+class FeedbackNoteTests(unittest.TestCase):
+    """`notes` 是 failures 的**模型侧**说法，只回灌给措辞模型。
+
+    预期：与 failures 一一对应（同序同长）；**模板一律中文**——合成的是中文数据，中英混排会让
+          2B 多一道翻译并译错；模板刻意用 `_INTERNAL_TERMS` 里的词（题干 / 载荷 / 必现串），
+          模型把反馈原文抄进产出时 `no_internal_terms` 当场拦下。
+          提示里可以出现载荷里的汉字与 ASCII 值（缺的串、答案），那是数据不是模板。
     """
 
     def test_clean_output_has_no_notes(self) -> None:
         self.assertEqual(verify(_spec(), _verbalized()).notes, ())
 
-    def test_notes_align_with_failures_and_are_english(self) -> None:
+    def test_notes_align_with_failures_and_are_chinese(self) -> None:
         result = verify(_spec(), _verbalized(stem="What is the reading?"))
         self.assertEqual(len(result.notes), len(result.failures))
         paired = dict(zip((item.split(":")[0] for item in result.failures), result.notes))
-        self.assertEqual(
-            paired["stem_is_chinese"],
-            "The stem contains no Chinese characters. Write it as Chinese prose.",
+        self.assertEqual(paired["stem_is_chinese"], "题干里一个汉字都没有。用中文把这道题写出来。")
+
+    def test_every_note_is_chinese_prose(self) -> None:
+        """每一条模型侧反馈都必须含汉字，且与 failures **同序同长**。
+
+        逐条触发一遍闸门，再查有没有「一个汉字都没有」的反馈——那样的一条就是英文模板漏回了
+        模型上下文（中英混排会多一道翻译并译错）。
+        同时逐条断言 `len(notes) == len(failures)`：闸门加了 failures 却忘了配套 note 时，
+        `_run_one` 只能把带闸门名的原文回灌给模型（实测 `no_source_copy` 就是这样漏的）。
+        """
+        cases = (
+            (_spec(), _verbalized(stem="What is the reading?")),
+            (_spec(), _verbalized(explanation="「㐀」读作别的音。")),
+            (_spec(), _verbalized(stem="「㐀」读作 qiu1 吗？")),
+            (_spec(must_contain=("hao3",)), _verbalized()),
+            (_spec(hidden_subject="㐁"), _verbalized()),
+            (_spec(), _verbalized(stem="「㐀」一共 7 画，读音是什么？")),
+            (_spec(), _verbalized(stem="这个字的 stroke_total 是多少？")),
+            (_spec(), _verbalized(stem="题干说的是这个字的读音。")),
+            (_spec(instruction="「㐀」的读音"), _verbalized(stem="「㐀」的读音")),
+            (_spec(), _verbalized(stem="「㐀」读作 qiu1。\n")),
+            (_spec(), _verbalized(stem="「㐀」读作 qiu1 还是 [[2]]？")),
+            (_spec(), _verbalized(explanation="qiu1")),
+            (_spec(), _verbalized(stem="「㐀」的读音，拼音，念作，读法是什么？")),
+            (
+                _spec(facts={"meaning_source": "这个字表示一种古代的礼器名称用来盛放祭品"}),
+                _verbalized(stem="「㐀」的读音是什么？这个字表示一种古代的礼器名称用来盛放祭品"),
+            ),
         )
+        notes = []
+        for spec, out in cases:
+            result = verify(spec, out)
+            self.assertEqual(
+                len(result.notes), len(result.failures),
+                f"notes 与 failures 没对齐：{result.failures} / {result.notes}",
+            )
+            notes.extend(result.notes)
+        self.assertTrue(notes)
+        barren = [note for note in notes if not any("\u4e00" <= ch <= "\u9fff" for ch in note)]
+        self.assertEqual(barren, [], barren)
 
     def test_missing_required_string_is_named_in_the_note(self) -> None:
         """反馈必须指名道姓说出缺哪个串，否则模型只能猜（实测 T12/T13 反复在同一处摔）。"""

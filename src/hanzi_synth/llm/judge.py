@@ -26,29 +26,32 @@ from .provider import ChatClient
 from .verbalizer import extract_json
 
 def _criteria_block() -> str:
-    """输入：无。输出：四条判据的编号清单。
+    """输入：无。输出：五条判据的编号清单。
     预期：与措辞提示词共用 `verify.checks.JUDGE_CRITERIA`——两边各自写一份就会漂移，
           变成「裁判按 A 判、回答的模型按 B 写」这种没人能发现的错位。
     """
     return "\n".join(f"{i}. {text}" for i, (_name, text) in enumerate(JUDGE_CRITERIA, start=1))
 
 
-JUDGE_SYSTEM_PROMPT = f"""你是一道题目的**读者**，手里只有这道题本身，没有别的资料。
+# **中文**：合成的是中文数据，判据与理由一律中文——英文要多一道翻译，2B 会译错，
+# 译错的词还会跟着理由一起回灌给措辞模型。
+JUDGE_SYSTEM_PROMPT = f"""你是这道题的一个读者。你手上只有这道题本身。
 
-我会给你一个 JSON：`stem`（题干）、`explanation`（解析）、`options`（选项，可能为空）、
-`answer`（标准答案）。你要判下面四件事：
+你会收到一个 JSON 对象：`stem`（题干）、`explanation`（解析）、`options`（候选，可能为空）、
+`answer`（定死的正确答案）。判下面五条：
 
 {_criteria_block()}
 
-只输出一个 JSON 对象，不要 markdown 围栏，不要任何前后缀说明：
-{{"ok": true 或 false, "reason": "一句话理由（ok 为 true 时写「无」）"}}
+只回一个 JSON 对象，不要 markdown 围栏，不要前后任何说明：
+{{"ok": true 或 false, "reason": "一句很短的否决理由；ok 为 true 时留空"}}
 """
 
 
 @dataclass(frozen=True)
 class Judgement:
     """输入：一次裁判调用的结果。输出：不可变结果对象。
-    预期：`error` 非空 = 这次裁判**没跑成**（网络错 / 输出不合法），调用方按「裁判缺席」处理；
+    预期：`error` 非空 = 这次裁判**没跑成**（网络错 / 输出不合法），调用方按「裁判缺席」处理：
+          重问（`pipeline/run.py` 的 `_judge_with_retries`）；重问完仍缺席就不发布。
           `error` 为空且 `ok=False` 才是真正的「裁判否决」。
     """
 
@@ -60,7 +63,7 @@ class Judgement:
 
     @property
     def absent(self) -> bool:
-        """输入：无。输出：裁判这次是不是缺席（没跑成）。预期：缺席不参与发布决策。"""
+        """输入：无。输出：裁判这次是不是缺席（没跑成）。预期：缺席不是通过——重问，仍缺席则不发布。"""
         return bool(self.error)
 
     def as_dict(self) -> dict:

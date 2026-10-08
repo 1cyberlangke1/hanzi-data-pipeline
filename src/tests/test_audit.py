@@ -7,12 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from hanzi_synth.pipeline.run import spec_from_record
 from hanzi_synth.pipeline.audit import (
+    _missing_gates,
     audit_record,
     audit_sources,
     collect_sources,
     is_published_record,
     is_published_source,
+    recheck_strength,
     write_jsonl,
 )
 
@@ -65,6 +68,59 @@ class AuditRecordTests(unittest.TestCase):
         self.assertEqual(outcome["tier"], "A")
         self.assertEqual(outcome["failures"], [])
 
+    def test_recorded_llm_arbitration_is_honoured(self) -> None:
+        """记录里写着「子串比对没过、但 LLM 仲裁判过」→ 门禁认这份结论，不重判成失败。
+
+        预期：解析用中文数字说出答案（「六画」而不是 `6`）时子串比对必然判不出，主流程靠 LLM
+              仲裁放行；门禁只重跑机械闸门，若不认这份记录，同一条数据就会「主流程发布、
+              门禁剔掉」——实测 93 条被剔记录里 62 条正是这一类。
+        """
+        row = make_record(
+            explanation="这个字「好」一共是六画。",
+            verification={
+                "answer_in_explanation": True,
+                "semantic_answer": "LLM 仲裁：解析说的是标准答案",
+            },
+        )
+        outcome = audit_record(row)
+        self.assertTrue(outcome["keep"], outcome["failures"])
+        self.assertEqual(outcome["failures"], [])
+        self.assertEqual(outcome["verification"].semantic_answer, "LLM 仲裁：解析说的是标准答案")
+
+    def test_arbitration_marker_without_conclusion_is_not_a_pass(self) -> None:
+        """只有「判过」的痕迹才算数：仲裁缺席、或记录里根本没这份结论，一律照旧判 C。"""
+        absent = make_record(
+            explanation="这个字「好」一共是六画。",
+            verification={"answer_in_explanation": False, "semantic_answer": "仲裁缺席（超时）"},
+        )
+        self.assertFalse(audit_record(absent)["keep"])
+        unmarked = make_record(explanation="这个字「好」一共是六画。")
+        self.assertFalse(audit_record(unmarked)["keep"])
+
+    def test_dropped_row_carries_a_replay_payload(self) -> None:
+        """旁路行必须带得动回炉：`spec` 能重建 TaskSpec，`cli replay` 直接吃。
+
+        预期：「不进数据集」不等于「可以丢」。只留 task_id / ziid / 原因的话，回炉还得人工回源
+              文件里找那条记录——那就是事实上的丢弃。
+        """
+        row = make_record(
+            answer="㐀",
+            accepted=["㐀"],
+            options=["㐀", "㐁"],
+            facts={"zi": "㐀"},
+            stem="请从下列选项中选出笔画最少的字。",
+            explanation="「㐀」是笔画最少的。",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _kept, dropped, _report = audit_sources([write_rows(Path(tmp) / "a.jsonl", [row])])
+        self.assertEqual(len(dropped), 1)
+        payload = dropped[0]["spec"]
+        self.assertNotIn("stem", payload)
+        self.assertNotIn("explanation", payload)
+        restored = spec_from_record(payload)
+        self.assertEqual(restored.answer, "㐀")
+        self.assertEqual(tuple(restored.options), ("㐀", "㐁"))
+
     def test_choice_record_without_candidates_is_rejected(self) -> None:
         """选择题题干没列出候选 → 判 C，失败原因里点名缺了哪个候选。"""
         row = make_record(
@@ -101,11 +157,66 @@ class AuditRecordTests(unittest.TestCase):
         self.assertEqual(outcome["tier"], "A")
         self.assertFalse(outcome["keep"])
 
-    def test_roundtrip_absence_is_not_a_veto(self) -> None:
-        """往返检验**缺席**（请求挂了 / 输出坏了）不算否决：工具问题不判数据死刑。"""
+    def test_roundtrip_absence_is_not_a_pass(self) -> None:
+        """往返检验**缺席**（请求挂了 / 输出坏了）不算否决、也不算通过：不许发布。
+
+        缺席是「这条检验没跑成」，不是对文本的判决，所以理由单列「读者缺席」桶；
+        但没被读过的记录同样不能进数据集（与 `_publishable` 同口径）——它进旁路等重新合成。
+        """
         row = make_record(roundtrip={"ok": False, "error": "往返检验请求失败"})
         outcome = audit_record(row)
-        self.assertTrue(outcome["keep"])
+        self.assertEqual(outcome["tier"], "A")
+        self.assertFalse(outcome["keep"])
+        self.assertTrue(any("读者缺席" in f for f in outcome["failures"]), outcome["failures"])
+
+    def test_offline_template_record_needs_no_roundtrip(self) -> None:
+        """离线模板产出：机械闸门字段齐全、没有 `roundtrip`，照样算查得全、可以发布。
+
+        预期：往返检验的对象是**模型写的那段自然语言**；离线产出的自然语言是程序按句式池
+              拼的，检验对象不存在。把它判成「查得不严」会让 705,175 条离线数据一条都进不了
+              数据集（实测 `kept 0 / dropped 705,175`）。
+        """
+        row = make_record(provenance={"mode": "offline-template", "variant": 7})
+        del row["roundtrip"]
+        self.assertEqual(recheck_strength(row), "full")
+        outcome = audit_record(row)
+        self.assertTrue(outcome["keep"], outcome["failures"])
+        self.assertEqual(outcome["failures"], [])
+
+    def test_missing_roundtrip_still_blocks_model_written_record(self) -> None:
+        """豁免只认 `provenance.mode`：措辞记录漏掉 `roundtrip` 仍然算没查过、不发布。"""
+        row = make_record()
+        del row["roundtrip"]
+        self.assertEqual(recheck_strength(row), "partial")
+        self.assertIn("roundtrip", _missing_gates(row))
+
+    def test_offline_template_still_needs_mechanical_gates(self) -> None:
+        """豁免的只是 `roundtrip`：离线记录缺机械闸门字段照样算 partial、不发布。"""
+        row = make_record(provenance={"mode": "offline-template"})
+        del row["roundtrip"]
+        del row["stem_asks_any"]
+        self.assertEqual(recheck_strength(row), "partial")
+        self.assertEqual(_missing_gates(row), ["stem_asks_any"])
+
+    def test_offline_exemption_is_counted_in_report(self) -> None:
+        """报告要如实报出「有多少条没被读者读过」：豁免不能是个看不见的数。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            offline = make_record(provenance={"mode": "offline-template"})
+            del offline["roundtrip"]
+            source = write_rows(Path(tmp) / "offline.jsonl", [offline, make_record()])
+            kept, dropped, report = audit_sources([source])
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped, [])
+        self.assertEqual(report["offline_records"], 1)
+        self.assertEqual(report["offline_roundtrip_exempt"], 1)
+
+    def test_judge_absence_is_not_a_pass(self) -> None:
+        """裁判**缺席**（跑挂了）同样不算通过：不许发布，理由单列「裁判缺席」桶。"""
+        row = make_record(judge={"ok": False, "error": "裁判请求失败"})
+        outcome = audit_record(row)
+        self.assertEqual(outcome["tier"], "A")
+        self.assertFalse(outcome["keep"])
+        self.assertTrue(any("裁判缺席" in f for f in outcome["failures"]), outcome["failures"])
 
 
 class SourceCollectionTests(unittest.TestCase):

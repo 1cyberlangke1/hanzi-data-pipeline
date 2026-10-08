@@ -38,6 +38,20 @@ def _utf8_of(char: str) -> str:
     return codepoint_surfaces(char)[3]
 
 
+def _value_forms(char: str) -> tuple[str, ...]:
+    """输入：单个字符。输出：**自明**的码位数值写法——带 `U+` 前缀的十六进制、十进制。
+
+    预期：`codepoint_surfaces` 的第 2 条是**裸十六进制**（`3406`），它和十进制写法
+          （`13318`）在文本里长得一模一样，读者按十进制读会读到另一个码位（3406 = U+0D4E）。
+          实测全量离线数据里，T14 有 15,085 条解析写成「㐆的 Unicode 码位是 3406」、
+          T16 有 45,157 条题干写成「码位3406对应的字」——同一个词「码位」在一份数据集里
+          时而指十六进制时而指十进制，是**自相矛盾的数据**，所以裸十六进制不进主答案、
+          也不进题干（它仍然是合法答案，见 `build_unicode_codepoint` 的 aliases）。
+    """
+    forms = codepoint_surfaces(char)
+    return (forms[0], forms[2])
+
+
 def _pick_form(
     char: str, rng: random.Random, *, forms: tuple[str, ...] | None = None
 ) -> tuple[str, tuple[str, ...]]:
@@ -96,16 +110,24 @@ def build_unicode_codepoint(
     if not character.has_codepoint or not character.zi:
         return None
     forms = codepoint_surfaces(character.zi)
-    answer, aliases = _pick_form(character.zi, rng, forms=forms[:3])  # 只轮换数值写法
+    values = _value_forms(character.zi)
+    answer, aliases = _pick_form(character.zi, rng, forms=values)
+    # 裸十六进制（forms[1]）仍算答对，只是不当主答案：当主答案时解析会写成「码位是 3406」，
+    # 那既像十进制又像十六进制。判分集合保留它，表述不保留它。
+    aliases = (*aliases, forms[1])
     return TaskSpec(
         task_id="T14_unicode_codepoint",
+        payload_facts=("zi", "codepoint_forms"),
         instruction=(
-            f"Ask the reader for the Unicode code point of the character 「{character.zi}」, in "
-            f"either in hexadecimal or as the equivalent decimal number."
+            f"「{character.zi}」的 Unicode 码点"
         ),
         facts={
             "zi": character.zi,
-            "codepoint_forms": list(forms),
+            # 只放**码点**写法（带前缀 hex / 裸 hex / 十进制）。`codepoint_surfaces` 的后两条
+            # 是 UTF-8 字节序列与 UTF-16 代理对，那是「编码」不是「码点」——混进这个键里，
+            # 措辞模型会把字节串当码点写进题干（实测产出「给出码位 E3 90 8B，让读者从下列
+            # 选项中选出对应的字」，主人点名过）。
+            "codepoint_forms": list(values),
             "stroke_total": character.stroke_total,
             "radical": character.radical,
         },
@@ -160,8 +182,9 @@ def build_unicode_bytes(
     )
     return TaskSpec(
         task_id="T15_unicode_bytes",
+        payload_facts=("zi", "utf8_bytes", "byte_count"),
         instruction=(
-            f"Ask the reader for the hexadecimal UTF-8 byte sequence of the character 「{character.zi}」."
+            f"「{character.zi}」在 UTF-8 下的十六进制字节序列"
         ),
         facts=facts,
         answer=answer,
@@ -186,11 +209,12 @@ def build_unicode_reverse(
     """
     if not character.has_codepoint or not character.zi:
         return None
-    # 「码位」只能是**数值写法**：`codepoint_surfaces` 的第 4 条是 UTF-8 字节序列、第 5 条是
-    # UTF-16 代理对，那两条都不是码位。旧版从**全部**写法里轮换，实测产出会写成
-    # 「给出码位 E3 90 8B，让读者从下列选项中选出对应的字」——那是 UTF-8 字节，读者拿它当码位
-    # 去查会查到别的字（主人点名过这条）。T14 同样只轮换前三条（见 `build_unicode_codepoint`）。
-    shown, _ = _pick_form(character.zi, rng, forms=codepoint_surfaces(character.zi)[:3])
+    # 「码位」只能是**自明**的数值写法（见 `_value_forms`）：`codepoint_surfaces` 的第 4 条是
+    # UTF-8 字节序列、第 5 条是 UTF-16 代理对，那两条都不是码位；第 2 条是裸十六进制，与十进制
+    # 写法在文本里无法区分。旧版从**全部**写法里轮换，实测产出会写成「给出码位 E3 90 8B，让读者
+    # 从下列选项中选出对应的字」（主人点名过）——现在只轮换带前缀十六进制与十进制两种。
+    values = _value_forms(character.zi)
+    shown, _ = _pick_form(character.zi, rng, forms=values)
     distractors = char_distractors(
         index,
         character,
@@ -204,13 +228,15 @@ def build_unicode_reverse(
     options = (character.zi, *(d.text for d in distractors))
     return TaskSpec(
         task_id="T16_unicode_reverse",
+        payload_facts=("codepoint", "codepoint_forms"),
         instruction=(
-            f"Ask the reader which of the listed candidates is the character whose code point is "
-            f"{shown}."
+            # 候选写进说明（同 T10 的理由）：只写「候选里」2B 就不列候选，题干没有可选项。
+            f"{'、'.join(options)} 里码点等于 {shown} 的那个字"
         ),
         facts={
             "codepoint": shown,
-            "codepoint_forms": list(codepoint_surfaces(character.zi)),
+            # 同 T14：只留码点写法，UTF-8 字节序列不进这个键。
+            "codepoint_forms": list(values),
             "zi": character.zi,
             "radical": character.radical,
             "stroke_total": character.stroke_total,

@@ -102,19 +102,26 @@ def build_reading(
                 readings.append(reading)
     if len(readings) != 1:
         return None  # 0 个 = 没材料；多个 = 多音字，题目有歧义
-    answer = readings[0]
-    variants = reading_surfaces(answer)
-    shown = variants[rng.randrange(len(variants))]
+    canonical = readings[0]
+    variants = reading_surfaces(canonical)
+    # 答案在**等价写法之间轮换**（`xie2` 与 `xié` 是一个东西）：主人要求 ascii 与带调
+    # 两种写法在数据集层面都成分布，而不是永远只写 ascii、把带调写法塞进别名里。
+    # 其余写法进 `answer_aliases`，判分照样算对。
+    picked = rng.randrange(len(variants))
+    answer = variants[picked]
+    aliases = variants[:picked] + variants[picked + 1 :]
+    shown = variants[(picked + 1) % len(variants)] if len(variants) > 1 else canonical
     return TaskSpec(
         task_id="T4_reading",
+        payload_facts=("zi", "reading_display"),
         instruction=(
-            f"Ask the reader how the character 「{character.zi}」 is pronounced."
+            f"「{character.zi}」的读音"
         ),
-        facts={"zi": character.zi, "reading": answer, "reading_display": shown, "radical": character.radical},
+        facts={"zi": character.zi, "reading": canonical, "reading_display": shown, "radical": character.radical},
         # 题干闸门：答案是**读音**，题干必须问读音（同 T1 的理由——闸门空着等于不设防）
         stem_asks_any=_READING_ASK_MARKERS,
         answer=answer,
-        surface_forms=variants[1:],
+        answer_aliases=aliases,
         visible_subject=character.zi,
         distractors=_reading_distractors(answer, rng, difficulty.distractor_depth),
         proof=(f"这个字的读音是 {shown}",),

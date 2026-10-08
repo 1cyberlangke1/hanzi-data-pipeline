@@ -35,7 +35,17 @@
 该有的识别串一个不缺（那个字本身、读音、释义、部首、笔画，或整份候选名单），读者还说「没说清问
 哪个字」就是误报（实测 T13 反向题 / T8 约束题两条好题因此被丢掉）——见 `subject_identified_by_gates`。
 
-读者缺席（请求失败 / 输出不是合法 JSON / 字段缺席）**一律不算否决**：那是工具问题，不是数据问题。
+读者缺席（请求失败 / 只吐思考段 / 输出不是合法 JSON / 合法 JSON 但没给答案）**既不算否决、也不算通过**：那是工具没干成活，
+不是「这段文字不合格」。所以调用方（`pipeline/run.py` 的 `_roundtrip_with_retries`）先重问同一个问题；
+重问完仍缺席的题**不发布**（进 rejects 回炉）——题不会丢，也不会带着「读者没读过的题」进数据集。
+
+**第二次请求：措辞检验（L4.7）。** 上面四条判据只看题干。解析里夹带「写给写题人的话」同样要拦，
+但解析不能塞进那一次的载荷——解析里写着答案，读者照抄就算「答对」，「题干自不自足」那一判立刻
+退化成恒真（实测：带解析跑 6 条，4 条题干不自足的题全被判过）。所以措辞检验单开一次请求，载荷
+是（题干 + 解析），**不要求读者作答**，只要求它把「不是写给读者的话」原样摘出来。
+摘话是闭集动作，2B 做得到（与上面 `writer_phrases` 同类，实测 13/13 标定通过）；
+实测它抓到的典型漏网：解析写成「证明这个分解方式是正确的」「具体含义需根据上下文判断」。
+这一次请求只在**其余判据都已通过**时才发——已经被否决的题马上要重新措辞，没必要再花一次配额。
 """
 
 from __future__ import annotations
@@ -88,6 +98,63 @@ ROUNDTRIP_SYSTEM_PROMPT = """你是一个读者，手里只有下面这道汉字
 只输出一个 JSON 对象，不要 markdown 围栏，不要任何前后缀说明：
 {"is_question": true 或 false, "identifies_subject": true 或 false, "answer": "...", "writer_phrases": [], "note": "一句话说明"}
 """
+
+# L4.7 措辞检验：把**解析**也纳入「有没有写给写题人的话」这一判。
+# 为什么单开一次请求、而不是并进上面那一次：上面那一次的载荷刻意不含解析（给了它，读者照抄答案，
+# 「题干自不自足」就判不出来了）。两件事的载荷不同，只能分两次。
+# 这一次**不要求读者作答**，只要求摘话——摘话是闭集动作，与上面 `writer_phrases` 同类。
+WRITING_SYSTEM_PROMPT = """你是一个读者，手里只有下面这道汉字题（题干 + 解析）。
+
+请只做一件事：找出**写给写题人、而不是写给读者**的话。
+
+这类话在指挥别人怎么写题，或者在说出题过程本身，例如：
+- 「请列出所有候选」「不要出现数字」「必须原样引用」；
+- 「本题要求…」「根据上面的说明…」；
+- 「证明这个分解方式是正确的」「符合题意」；
+- 「具体含义需根据上下文判断」「无法确定」。
+
+下面这些话**不是**这类话，一句都不要摘：
+- 题干对读者提的问题（「这个字的读音是什么？」）；
+- 解析对答案的正常说明（「它的读音是 qiu1」「这个字的意思是…」）。
+
+找到了就把那些话**逐字照抄**进 phrases 数组；一句都没有就写空数组 []。
+
+只输出一个 JSON 对象，不要 markdown 围栏，不要任何前后缀说明：
+{"phrases": [], "note": "一句话说明"}
+"""
+
+
+def build_writing_messages(verbalized: Any) -> list[dict]:
+    """输入：L3 产出。输出：OpenAI 格式 messages。
+
+    预期：载荷只放**读者看得到的两段文字**（题干 + 解析），不放选项 / 答案 / 内部字段——
+          这一次判的是「这两段话里有没有不是写给读者的话」，与答案对不对无关，
+          给了答案反而会让模型拿它当尺子。
+    """
+    payload = {
+        "stem": getattr(verbalized, "stem", ""),
+        "explanation": getattr(verbalized, "explanation", ""),
+    }
+    return [
+        {"role": "system", "content": WRITING_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def scan_writing(client: ChatClient, verbalized: Any, *, temperature: float = 0.0) -> tuple[tuple[str, ...], str]:
+    """输入：客户端 + L3 产出 + 温度。输出：(摘出来的话, 错误)。
+
+    预期：错误非空 = 这次没跑成（**缺席**）——调用方按缺席处理（重问，仍缺席则不发布）。
+          输出不是合法 JSON、或没有 `phrases` 数组，一律算缺席，**不按「没意见」放行**：
+          放行会让「这条其实没被检验过」的记录混进数据集，而记录里却写着检验通过。
+    """
+    completion = client.complete(build_writing_messages(verbalized), temperature=temperature)
+    if not completion.ok:
+        return (), completion.error or "措辞检验请求失败"
+    data = extract_json(completion.text)
+    if not isinstance(data, dict) or not isinstance(data.get("phrases"), list):
+        return (), "措辞检验输出不是合法 JSON（缺少 phrases 数组）"
+    return tuple(str(item) for item in data["phrases"] if str(item).strip()), ""
 
 # 归一化时要剥掉的包装字符：模型常把答案写成「㐑」或者 "㐑" 或者 答案是：㐑
 _WRAPPERS = "「」『』“”\"\'‘’（）()[]【】《》<>：: ，,。.、\n\t "
@@ -354,10 +421,12 @@ def subject_identified_by_gates(verification: Any) -> bool | None:
 @dataclass(frozen=True)
 class RoundTrip:
     """输入：一次读者检验的结果。输出：不可变结果对象。
-    预期：`error` 非空 = 这次没跑成（请求失败 / 输出不合法），调用方按**缺席**处理；
-          `error` 为空且 `ok=False` 才是真正的「这段文字不合格」——四条判据任一条不过都算。
+    预期：`error` 非空 = 这次没跑成（请求失败 / 只吐思考段 / 输出不合法），调用方按**缺席**处理：
+          重问；重问完仍缺席就不发布。`error` 为空且 `ok=False` 才是真正的「这段文字不合格」。
     """
 
+    # `writer_phrases` 是**两次请求的并集**：题干那次（L4.6）与题干+解析那次（L4.7）。
+    # 分开两次是因为载荷不能合并（解析里写着答案，读者看见它「题干自不自足」就判不出来了）。
     ok: bool
     is_question: bool = True
     identifies_subject: bool = True
@@ -372,7 +441,7 @@ class RoundTrip:
 
     @property
     def absent(self) -> bool:
-        """输入：无。输出：这次检验是不是缺席。预期：缺席不参与发布决策。"""
+        """输入：无。输出：这次检验是不是缺席。预期：缺席不是通过——调用方重问，仍缺席则不发布。"""
         return bool(self.error)
 
     def as_dict(self) -> dict:
@@ -419,9 +488,13 @@ def roundtrip_answer(
     """输入：客户端 + TaskSpec + L3 产出 + 温度 + 可选的答案仲裁客户端。输出：RoundTrip。
 
     预期：温度默认 0——这条检验要的是稳定复现，不是发挥；
-          请求失败 / JSON 不合法，一律记 `error`（缺席），不判否决；
-          四个判据字段里，布尔字段缺席按 true、`writer_phrases` 缺席按空、`answer` 缺席
-          按「不比对」处理——**缺席不否决**是这一层的总规矩（工具问题不判数据死刑）。
+          **两次请求**：先按上面四条判据读题干，四条都过之后**再**发一次措辞检验（`scan_writing`，
+          载荷是题干 + 解析），把两次摘出的「写给写题人的话」并成一个元组。其余判据已被否决时不发
+          第二次——那条马上要重新措辞，再花一次配额没有意义（`ok=False` 的短路在 `roundtrip_answer` 里）。
+          请求失败 / JSON 不合法 / **合法 JSON 但没给答案**，一律记 `error`（缺席），不判否决；
+          `answer` 是唯一**必需**字段：读者答了才说明它真把题干读进去了，只回一句说明不算读过。
+          其余三个判据字段缺席按不否决处理（布尔按 true、`writer_phrases` 按空数组）——
+          那是「读过了没意见」，不是「没读」。
           答案比对**快速通过 → LLM 判定**：子串比对（含机器值的写法归一）过了就是过了，不再花
           配额；没过且给了 `answer_judge` 时，**判定权交给 LLM**——读者写的是自然语言，只有它
           判得了「是不是同一个答案」。读者自报「知识题 / 缺条件」是分类不是答案，不送仲裁。
@@ -461,45 +534,66 @@ def roundtrip_answer(
     raw_phrases = data.get("writer_phrases")
     writer_phrases = tuple(str(item) for item in raw_phrases) if isinstance(raw_phrases, list) else ()
     raw_answer = data.get("answer")
-    answer, answer_ok, answer_checked = "", True, ""
-    if isinstance(raw_answer, str) and raw_answer.strip():
-        answer = raw_answer
-        self_report = normalize_answer(raw_answer)
-        self_reported = _MISSING in self_report or _KNOWLEDGE in self_report
-        if _MISSING in self_report and subject_identified is True:
-            # 旁证推翻读者的自报：机械闸门确认识别串一个不缺，那「没说清问哪个字」就是读者误报。
-            answer_ok = True
-            answer_checked = "规则：题干已含识别条件，读者自报缺条件不予否决"
-        else:
-            # **快速通过**：答案串（含机器值的写法归一）在读者那句话里找得到就算过。这一步只用来
-            # 省配额——它判不了自然语言那一层（读者写「读作 xié」而标准答案是 `xie2`，子串里没有
-            # `xie2`），判定权在下面那一步。
-            answer_ok = reader_answer_ok(spec, raw_answer)
-            answer_checked = "规则：快速通道"
-            if not answer_ok and not self_reported:
-                # 读者照着题干里的料答错 = 题干把读者带偏了（这是题目的毛病）；读者凭空编一个题干里
-                # 没有的值 = 它在猜（汉字题一大类是知识题，2B 读者没有那些知识，编值是常态，不算
-                # 题目的毛病）。这条机械旁证只在**仲裁缺席**时用来兜底。
-                traceable = _traceable_to_stem(getattr(verbalized, "stem", ""), raw_answer)
-                if answer_judge is not None:
-                    equivalent, reason, error = answer_equivalent(answer_judge, spec, raw_answer)
-                    if equivalent is None:
-                        answer_ok = not traceable
-                        fallback = (
-                            "读者答出的值在题干里有出处（题干把读者带偏了）" if traceable
-                            else "读者答出的值在题干里没有出处（在猜），不予否决"
-                        )
-                        answer_checked = f"仲裁缺席（{error}）；规则：{fallback}"
-                    else:
-                        answer_ok = equivalent
-                        answer_checked = f"LLM 仲裁（{reason or '未给理由'}）"
-                elif traceable:
-                    answer_checked = "规则：读者答出的值在题干里有出处（题干把读者带偏了）"
+    if not (isinstance(raw_answer, str) and raw_answer.strip()):
+        # 读者没作答 = 这次没读成（缺席）：与「请求挂了」同一条规矩——先重问，仍缺席则不发布。
+        # 不能按「不比对」放行：那样记录里写着「读者检验 ok」，而读者其实一个字都没答。
+        return RoundTrip(
+            ok=False, error="读者没有作答",
+            provider=completion.provider, model=completion.model,
+        )
+    answer, answer_ok, answer_checked = raw_answer, True, ""
+    self_report = normalize_answer(raw_answer)
+    self_reported = _MISSING in self_report or _KNOWLEDGE in self_report
+    if _MISSING in self_report and subject_identified is True:
+        # 旁证推翻读者的自报：机械闸门确认识别串一个不缺，那「没说清问哪个字」就是读者误报。
+        answer_ok = True
+        answer_checked = "规则：题干已含识别条件，读者自报缺条件不予否决"
+    else:
+        # **快速通过**：答案串（含机器值的写法归一）在读者那句话里找得到就算过。这一步只用来
+        # 省配额——它判不了自然语言那一层（读者写「读作 xié」而标准答案是 `xie2`，子串里没有
+        # `xie2`），判定权在下面那一步。
+        answer_ok = reader_answer_ok(spec, raw_answer)
+        answer_checked = "规则：快速通道"
+        if not answer_ok and not self_reported:
+            # 读者照着题干里的料答错 = 题干把读者带偏了（这是题目的毛病）；读者凭空编一个题干里
+            # 没有的值 = 它在猜（汉字题一大类是知识题，2B 读者没有那些知识，编值是常态，不算
+            # 题目的毛病）。这条机械旁证只在**仲裁缺席**时用来兜底。
+            traceable = _traceable_to_stem(getattr(verbalized, "stem", ""), raw_answer)
+            if answer_judge is not None:
+                equivalent, reason, error = answer_equivalent(answer_judge, spec, raw_answer)
+                if equivalent is None:
+                    answer_ok = not traceable
+                    fallback = (
+                        "读者答出的值在题干里有出处（题干把读者带偏了）" if traceable
+                        else "读者答出的值在题干里没有出处（在猜），不予否决"
+                    )
+                    answer_checked = f"仲裁缺席（{error}）；规则：{fallback}"
                 else:
-                    answer_ok = True
-                    answer_checked = "规则：读者答出的值在题干里没有出处（在猜），不予否决"
+                    answer_ok = equivalent
+                    answer_checked = f"LLM 仲裁（{reason or '未给理由'}）"
+            elif traceable:
+                answer_checked = "规则：读者答出的值在题干里有出处（题干把读者带偏了）"
+            else:
+                answer_ok = True
+                answer_checked = "规则：读者答出的值在题干里没有出处（在猜），不予否决"
+    if not (is_question and identifies_subject and not writer_phrases and answer_ok):
+        # 其余判据已经否决：这条马上要重新措辞，再花一次配额去扫措辞没有意义。
+        return RoundTrip(
+            ok=False, is_question=is_question, identifies_subject=identifies_subject,
+            subject_checked=subject_checked, answer=answer, answer_checked=answer_checked,
+            writer_phrases=writer_phrases, note=str(data.get("note") or ""),
+            provider=completion.provider, model=completion.model,
+        )
+    # L4.7 措辞检验：题干 + 解析里有没有夹带写给写题人的话。缺席按缺席处理（重问，仍缺席不发布）。
+    extra_phrases, writing_error = scan_writing(client, verbalized, temperature=temperature)
+    if writing_error:
+        return RoundTrip(
+            ok=False, error=writing_error,
+            provider=completion.provider, model=completion.model,
+        )
+    writer_phrases = tuple(dict.fromkeys((*writer_phrases, *extra_phrases)))
     return RoundTrip(
-        ok=is_question and identifies_subject and not writer_phrases and answer_ok,
+        ok=not writer_phrases,
         is_question=is_question,
         identifies_subject=identifies_subject,
         subject_checked=subject_checked,

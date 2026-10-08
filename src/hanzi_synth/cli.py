@@ -6,6 +6,8 @@
     .\.venv\Scripts\python.exe -m hanzi_synth.cli run --limit 40  # 端到端小批量
     .\.venv\Scripts\python.exe -m hanzi_synth.cli reject-stats    # 只读：rejects 按防线汇总
     .\.venv\Scripts\python.exe -m hanzi_synth.cli attempt-stats   # 只读：逐轮判定，看首轮死在哪
+    .\.venv\Scripts\python.exe -m hanzi_synth.cli render          # 离线程序化渲染，不调模型
+    .\.venv\Scripts\python.exe -m hanzi_synth.cli render-stats    # 只读：逐题型量句式数量
 """
 
 from __future__ import annotations
@@ -40,17 +42,21 @@ from hanzi_synth.pipeline.audit import (
 )
 from hanzi_synth.pipeline.difficulty import estimate_irt_from_responses, load_responses, write_calibration
 from hanzi_synth.pipeline.roundtrip import run_roundtrip
+from hanzi_synth.render.generate import generate as generate_offline
+from hanzi_synth.render.offline import LLM_ONLY_TASK_IDS
+from hanzi_synth.render.stats import measure as measure_render_stats
 from hanzi_synth.pipeline.run import (
     DEFAULT_OUT,
     PipelineBusy,
     PipelineConfig,
+    auto_replay,
     coverage_report,
     replay_rejects,
     run_pipeline,
     summarize_attempts,
     summarize_rejects,
 )
-from hanzi_synth.tasks.base import DISTRACTOR_DEPTHS
+from hanzi_synth.tasks.base import DISTRACTOR_DEPTHS, MIXED_DEPTH, MIXED_LEVEL, Difficulty
 from hanzi_synth.tasks.registry import CONSTRUCTORS
 
 
@@ -85,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rejects", default=None, help="L7 回炉：对 rejects 文件里的失败样本单条重试，成功追加进主产出"
     )
     run.add_argument(
+        "--loop", type=int, default=0,
+        help="L7 自动回炉：主流程跑完后把 rejects 反复回炉，直到没有可回炉的样本（0=关；给的是最多轮数）"
+             "。每一轮吃上一轮的残留文件，救回的样本直接追加进主产出，一条都不丢"
+    )
+    run.add_argument(
         "--judge", action="store_true",
         help="L4.5：程序防线全过后再过一道 LLM 裁判（默认关；README §8.2 要求先做金标标定）",
     )
@@ -96,6 +107,34 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_exclude_flag(run)
     _add_difficulty_flags(run)
 
+    ren = sub.add_parser("render", help="离线程序化渲染：不调模型，句式由组合式模板池拼出")
+    ren.add_argument("--limit", type=int, default=200, help="最多产出多少条")
+    ren.add_argument("--tasks", default=None, help="逗号分隔的题型白名单")
+    ren.add_argument("--out", default="synthesis/out/offline_render.jsonl")
+    ren.add_argument(
+        "--dropped",
+        default=None,
+        help="落选样本（过不了闸门 / 渲染不出）的路径，默认落在 --out 旁边（<out>.dropped.jsonl）",
+    )
+    ren.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
+    ren.add_argument("--seed", type=int, default=20261006)
+    ren.add_argument("--min-per-type", type=int, default=0, help="每种题型至少产出多少条（0=不限制）")
+    # 离线数据集本来就该有难有易：三个难度旋钮默认走分布档 `mixed`。
+    _add_difficulty_knobs(
+        ren, hops_default=MIXED_LEVEL, constraints_default=MIXED_LEVEL, depth_default=MIXED_DEPTH,
+    )
+
+    rs = sub.add_parser("render-stats", help="只读：逐题型穷举句式空间，统计不同题干 / 解析 / 过闸门条数")
+    rs.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
+    rs.add_argument("--tasks", default=None, help="逗号分隔的题型白名单")
+    rs.add_argument("--per-type", type=int, default=1, help="每型取样几个字（默认 1）")
+    rs.add_argument("--seed", type=int, default=20261006)
+    rs.add_argument(
+        "--min-stems",
+        type=int,
+        default=500,
+        help="每型**渲染出来的不同题干**下限（含引号/收尾/候选写法），不达标返回退出码 1",
+    )
     cov = sub.add_parser("coverage", help="只读：看现有产出覆盖了池子里的多少字")
     cov.add_argument("--out", default=str(DEFAULT_OUT))
     cov.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
@@ -175,23 +214,52 @@ def _add_exclude_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_difficulty_flags(parser: argparse.ArgumentParser) -> None:
-    """输入：子命令解析器。输出：无（就地加参数）。
-    预期：难度旋钮必须能从命令行调——否则又变成「配置里有、实际调不动」的死开关。
+def _level_arg(text: str) -> int | str:
+    """输入：命令行给的难度档。输出：整数档（1..3）或分布档 `mixed`。
+    预期：数字转 int，非法值让 argparse 的 choices 报错——不能悄悄退成字符串 `"2"`，
+          那样 `Difficulty(hops="2")` 会带着一个假档位跑下去。
     """
-    parser.add_argument("--hops", type=int, default=1, choices=(1, 2, 3), help="T9/T12 的链长/编辑步数")
-    parser.add_argument("--constraints", type=int, default=1, choices=(1, 2, 3), help="T8 同时施加的条件个数")
+    return MIXED_LEVEL if text == MIXED_LEVEL else int(text)
+
+
+def _add_difficulty_knobs(
+    parser: argparse.ArgumentParser,
+    *,
+    hops_default: int | str = 1,
+    constraints_default: int | str = 1,
+    depth_default: str = "near",
+) -> None:
+    """输入：子命令解析器 + 三个默认档。输出：无（就地加参数）。
+    预期：难度旋钮必须能从命令行调——否则又变成「配置里有、实际调不动」的死开关。
+          `mixed` 是**分布档**：按权重抽样落成具体值，让难度在数据集层面成分布。
+          `run` 用固定档当默认，`render` 用 mixed 当默认（离线数据集本来就该有难有易）。
+    """
     parser.add_argument(
-        "--distractor-depth", default="near", choices=DISTRACTOR_DEPTHS,
+        "--hops", default=hops_default, type=_level_arg, choices=(1, 2, 3, MIXED_LEVEL),
+        help="T9/T12 的链长/编辑步数；mixed = 按 3:3:4 抽样（1 跳权重最高）"
+    )
+    parser.add_argument(
+        "--constraints", default=constraints_default, type=_level_arg, choices=(1, 2, 3, MIXED_LEVEL),
+        help="T8 同时施加的条件个数；mixed = 按 3:3:4 抽样（1 条权重最高）"
+    )
+    parser.add_argument(
+        "--distractor-depth", default=depth_default, choices=DISTRACTOR_DEPTHS,
         help="干扰项距离档（near 最难）；mixed = 按 near 4 : mid 3 : far 2 抽样，让难度成分布"
     )
+
+
+def _add_difficulty_flags(parser: argparse.ArgumentParser) -> None:
+    """输入：子命令解析器。输出：无（就地加参数）。
+    预期：`run` 的难度旋钮（同 `_add_difficulty_knobs`）+ 池子规模 / 并发 / 重试。
+    """
+    _add_difficulty_knobs(parser)
     parser.add_argument("--pool", type=int, default=0, help="索引只建在前 N 个字上；0 = 全池")
     parser.add_argument("--max-scan", type=int, default=20000, help="出题阶段最多扫描多少个字")
     parser.add_argument(
-        "--workers", type=int, default=1, help="L3 措辞的并发线程数（远端网关接近线性；本机端点会被收到 LOCAL_WORKER_CAP=2）"
+        "--workers", type=int, default=1, help="L3 措辞的并发线程数（远端网关接近线性；本机端点会被收到 LOCAL_WORKER_CAP=4）"
     )
     parser.add_argument(
-        "--retries", type=int, default=1, help="L4 不过时换语体重试的次数（网络层的重试在 provider 里，是另一回事）"
+        "--retries", type=int, default=1, help="L4 不过时回灌原因重试的次数（网络层的重试在 provider 里，是另一回事）"
     )
     parser.add_argument(
         "--batch", type=int, default=0,
@@ -339,6 +407,57 @@ def main(argv: list[str] | None = None) -> int:
         print(f"数据集：{out_path}\n报告：{report_path}", file=sys.stderr)
         return 0
 
+    if args.command == "render":
+        # 离线渲染路径：不加载 provider、不联网，事实与答案全部来自 TaskSpec。
+        try:
+            stats = generate_offline(
+                limit=args.limit,
+                out_path=Path(args.out),
+                dropped_path=(Path(args.dropped) if args.dropped else None),
+                data_path=(Path(args.data) if args.data else None),
+                task_ids=_task_ids(args.tasks),
+                seed=args.seed,
+                min_per_type=args.min_per_type,
+                difficulty=Difficulty(
+                    hops=args.hops,
+                    constraints=args.constraints,
+                    distractor_depth=args.distractor_depth,
+                ),
+                progress=lambda msg: print(msg, flush=True),
+            )
+        except DataError as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "render-stats":
+        # 只读统计：穷举句式空间，量「每型有多少种不同句式」。
+        try:
+            report = measure_render_stats(
+                data_path=(Path(args.data) if args.data else None),
+                task_ids=_task_ids(args.tasks),
+                per_type=args.per_type,
+                seed=args.seed,
+                progress=lambda msg: print(msg, flush=True),
+            )
+        except DataError as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        # 释义类题（T13 / T17）不在上面这份报告里：它们走 LLM 路径，模板池里没有骨架。
+        # 单独说一声，免得这一行缺席被读成「模板池漏了这两型」。
+        print(f"离线模板池不覆盖（释义类，走 LLM 路径）：{sorted(LLM_ONLY_TASK_IDS)}", file=sys.stderr)
+        short = sorted(t for t, row in report.items() if row["stems"] < args.min_stems)
+        if short:
+            detail = "，".join(
+                f"{task_id}（句式 {report[task_id]['stems']}，其中问法骨架 {report[task_id]['skeletons']}）"
+                for task_id in short
+            )
+            print(f"句式不足 {args.min_stems} 的题型：{detail}", file=sys.stderr)
+            return 1
+        return 0
+
     try:
         config = PipelineConfig(
             limit=args.limit,
@@ -372,6 +491,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         stats = run_pipeline(config, progress=lambda msg: print(msg, flush=True))
+        loop_rounds = int(getattr(args, "loop", 0) or 0)
+        if loop_rounds > 0:
+            # 自动回炉：判失败的样本不是「丢掉」，而是反复回炉直到救回。收敛判据（一轮
+            # 没救回就刹车、残留文件不嵌套）全在 `auto_replay` 里，那部分有单测盯着。
+            stats["auto_loop"] = auto_replay(
+                lambda path: replay_rejects(
+                    config, path, progress=lambda msg: print(msg, flush=True)
+                ),
+                Path(args.out).with_suffix(".rejects.jsonl"),
+                max_rounds=loop_rounds,
+                say=lambda msg: print(msg, flush=True),
+            )
     except (ConfigError, DataError, PipelineBusy) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2

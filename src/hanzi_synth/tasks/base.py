@@ -24,6 +24,9 @@ class Difficulty:
     """输入：三个**已被真实使用**的难度旋钮。输出：不可变难度设定。
     预期：难度只由结构决定，不由措辞长度决定（明确排除伪难度）。
 
+    三个旋钮都另有**分布档** `mixed`：按权重抽样落成具体值，让难度在**数据集层面**成分布，
+    而不是全表一个值。`resolved()` 负责把 mixed 落定，`build_all` 每个字调一次。
+
     旋钮的消费方（改这里必须同步改构造器，否则又会变成死代码）：
     - `hops`             → T9 部件链的链长、T12 结构变换的编辑步数；
     - `constraints`      → T8 的约束档位（1 = 部首+总笔画，2 = 再加顶层结构，
@@ -37,35 +40,52 @@ class Difficulty:
     standard_form/zi/ziid 与 refs），没有数据源就只能靠猜，猜出来的难度标签是假的。
     """
 
-    hops: int = 1
-    constraints: int = 1
+    hops: int | str = 1
+    constraints: int | str = 1
     distractor_depth: str = "near"  # near / mid / far / mixed
 
     def __post_init__(self) -> None:
         """输入：无。输出：无。预期：越界值当场报错，而不是静默产出降级题目。"""
-        if not 1 <= self.hops <= 3:
-            raise ValueError(f"hops 必须在 1..3，收到 {self.hops}")
-        if not 1 <= self.constraints <= 3:
-            raise ValueError(f"constraints 必须在 1..3，收到 {self.constraints}")
+        if not _is_level(self.hops):
+            raise ValueError(f"hops 必须是 1..3 或 {MIXED_LEVEL!r}，收到 {self.hops!r}")
+        if not _is_level(self.constraints):
+            raise ValueError(f"constraints 必须是 1..3 或 {MIXED_LEVEL!r}，收到 {self.constraints!r}")
         if self.distractor_depth not in DISTRACTOR_DEPTHS:
             raise ValueError(f"distractor_depth 必须是 {DISTRACTOR_DEPTHS} 之一，收到 {self.distractor_depth!r}")
 
     def resolved(self, rng: random.Random) -> "Difficulty":
-        """输入：随机源。输出：把 `mixed` 落成具体档位后的 Difficulty。
-        预期：`build_all` 每个字调一次——这样同一个字的干扰项档位一致，
-              而难度注记里写的是**真实用到的档位**，不是配置里的 `mixed`。
+        """输入：随机源。输出：把三个 `mixed` 都落成具体值后的 Difficulty。
+        预期：`build_all` 每个字调一次——同一个字的跳数 / 约束数 / 干扰项档位一致，
+              难度注记里写的是**真实用到的值**，不是配置里的 `mixed`。
+              一个 mixed 都没有时原样返回自己（不新建对象、不消耗随机数）。
         """
-        if self.distractor_depth != MIXED_DEPTH:
+        if (
+            self.hops != MIXED_LEVEL
+            and self.constraints != MIXED_LEVEL
+            and self.distractor_depth != MIXED_DEPTH
+        ):
             return self
         return Difficulty(
-            hops=self.hops,
-            constraints=self.constraints,
+            hops=resolve_hops(self.hops, rng),
+            constraints=resolve_constraints(self.constraints, rng),
             distractor_depth=resolve_depth(self.distractor_depth, rng),
         )
 
 
 # 干扰项距离档位：near 最像（难）、far 最不像（易）
 DISTRACTOR_DEPTHS: tuple[str, ...] = ("near", "mid", "far", "mixed")
+
+# 难度旋钮的分布档：与 `distractor_depth` 的 `mixed` 同一思路，让难度在数据集层面成分布。
+MIXED_LEVEL = "mixed"
+# 权重是「难 : 中 : 易」。1 跳 / 1 条约束是覆盖保底，权重最高——抽到高档位却凑不出题时，
+# `build_all` 会沿阶梯退到最低档（见 `tasks.registry._difficulty_ladder`）。
+HOPS_MIX_WEIGHTS: tuple[tuple[int, int], ...] = ((3, 3), (2, 3), (1, 4))
+CONSTRAINT_MIX_WEIGHTS: tuple[tuple[int, int], ...] = ((3, 3), (2, 3), (1, 4))
+
+# 真正消费 hops / constraints 的题型。放在 tasks 层而不是 pipeline/difficulty.py：
+# 难度阶梯要在 build_all 里展开，而 tasks 层不能反向依赖 pipeline 层（会成环）。
+HOP_TASKS: tuple[str, ...] = ("T9_component_chain", "T12_ids_transform")
+CONSTRAINT_TASKS: tuple[str, ...] = ("T8_constraint",)
 
 # `mixed` 是一个**分布档**而不是第四个距离：按权重抽样，让难度在数据集层面成分布
 MIXED_DEPTH = "mixed"
@@ -79,13 +99,50 @@ def resolve_depth(depth: str, rng: random.Random) -> str:
     """
     if depth != MIXED_DEPTH:
         return depth
-    total = sum(weight for _name, weight in MIXED_DEPTH_WEIGHTS)
+    return _sample_weighted(MIXED_DEPTH_WEIGHTS, rng)
+
+
+def _is_level(value: Any) -> bool:
+    """输入：hops / constraints 的取值。输出：它是不是合法档位（1..3 或 `mixed`）。
+    预期：给 `Difficulty.__post_init__` 用；`True` / `False` 不算数字档位（bool 是 int 的子类）。
+    """
+    if value == MIXED_LEVEL:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 3
+
+
+def _sample_weighted(weights: tuple[tuple[Any, int], ...], rng: random.Random) -> Any:
+    """输入：[(值, 权重)] + 随机源。输出：按权重抽出的一个值。
+    预期：权重是正整数，抽一次 randrange（同种子可复现）；权重之和非正时当场报错。
+    """
+    total = sum(weight for _value, weight in weights)
+    if total <= 0:
+        raise ValueError(f"权重之和必须为正，收到 {weights!r}")
     roll = rng.randrange(total)
-    for name, weight in MIXED_DEPTH_WEIGHTS:
+    for value, weight in weights:
         if roll < weight:
-            return name
+            return value
         roll -= weight
-    return MIXED_DEPTH_WEIGHTS[-1][0]
+    return weights[-1][0]
+
+
+def resolve_hops(value: int | str, rng: random.Random) -> int:
+    """输入：hops 档（1..3 或 `mixed`）+ 随机源。输出：具体跳数。
+    预期：`mixed` 时按 3:3:4 抽样——多跳更接近真实难度，但 1 跳是覆盖保底，权重最高；
+          非 mixed 原样返回且**不消耗随机数**（否则固定档位的产出会被无谓扰动）。
+    """
+    if value != MIXED_LEVEL:
+        return value
+    return _sample_weighted(HOPS_MIX_WEIGHTS, rng)
+
+
+def resolve_constraints(value: int | str, rng: random.Random) -> int:
+    """输入：constraints 档（1..3 或 `mixed`）+ 随机源。输出：具体约束个数。
+    预期：与 `resolve_hops` 同一条规矩（同一套权重、非 mixed 不消耗随机数）。
+    """
+    if value != MIXED_LEVEL:
+        return value
+    return _sample_weighted(CONSTRAINT_MIX_WEIGHTS, rng)
 
 
 @dataclass(frozen=True)
@@ -105,8 +162,9 @@ class TaskSpec:
     """
 
     task_id: str
-    # 给 L3 的**机器面**出题说明：用**英文**写死。程序侧文本一律英文，模型把它连词带句搬进中文题干的路径就被切断了
-    # （实测：instruction 写中文时 2B 一字不改地把它当成题干输出，数据集里全是程序模板）。
+    # 给 L3 的**机器面**出题说明：一句中文的「要问什么」，写成**名词性短语**（「「㐀」的总笔画数」）。
+    # 名词性短语不是问句——2B 就算原样照抄也落不成一道题，往返检验的 `is_question` 当场判否，
+    # 所以不必再靠英文切断照抄路径（实测换成名词性短语后照抄从 9/12 降到 0/12）。
     # 它说的是「这道题要问什么」，不是最终题干——题干必须由 L3 用中文自己写。
     instruction: str
     facts: Mapping[str, Any]
@@ -131,6 +189,10 @@ class TaskSpec:
     # 本次实际使用的干扰项档位（`mixed` 解析后的结果）；空串 = 构造器未声明。
     # 有了它，产出的 difficulty 注记才写得出「这条到底是 near 还是 far」。
     resolved_depth: str = ""
+    # 本次实际使用的跳数 / 约束个数（`mixed` 解析 + 难度阶梯回退之后的结果）。
+    # 不消费该旋钮的题型恒为 1 / 1，与 `difficulty_note` 的口径一致。
+    resolved_hops: int = 1
+    resolved_constraints: int = 1
 
     # 题干**至少要命中其中一个**说法（空 = 不检查）：这是「题干问的必须是答案那件事」的闸门。
     # 实测 T13 的题干写「请问这个字是什么？」——问的是那个字本身，可答案是它的 IDS 拆解，
@@ -150,6 +212,16 @@ class TaskSpec:
     # 构造器保证 `meaning_source` 里本来就不含这个字（`character.zi not in cleaned` 才选用），
     # 所以「题干里出现它」只可能是模型自己写出来的——判据是**可靠的子串判据**，不会误杀。
     hidden_subject: str = ""
+
+    # 措辞层（L3）**真正需要**的事实键：`llm.verbalizer.payload_for` 只把这些键发给模型。
+    # 空 = 发全部（只给手工构造的 spec 用）；注册题型一律显式声明，`test_llm` 有单测钉住。
+    # 为什么要分开：`facts` 是**给闸门和离线渲染用的全集**（判分、干扰项、模板都要读它），
+    # 而措辞模型只需要「写这道题要引用的那几个值」。两者混在一起时，模型会拿别的题的材料
+    # 当素材——实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，产出写成
+    # 「给出码位 E3 90 8B，让读者从下列选项中选出对应的字」（那条已在构造器侧收窄）。
+    # 示范（`FEW_SHOT_TURNS`）
+    # 的 facts 形状就是「只发写这道题需要的键」，这里让真实载荷与示范同形。
+    payload_facts: tuple[str, ...] = ()
 
     @property
     def accepted(self) -> tuple[str, ...]:

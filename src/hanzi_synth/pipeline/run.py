@@ -18,6 +18,9 @@
 - **不丢数据的五道闸门**：①产出路径与输入数据是同一个文件时直接拒绝，原始数据不可能被覆盖；
   ②续跑只追加不截断；③上轮被掐断留下的半行先补换行再追加，避免新记录粘在残行尾部
   把两行一起毁掉；④每条落盘即 flush + fsync；⑤同一产出文件加独占锁，两批并发不会互相踩。
+- **缺席 ≠ 通过**：读者 / 裁判这类模型侧检验跑挂（请求失败 / 只吐思考段 / 输出不是 JSON）时先
+  **重问同一个问题**（`CHECK_ATTEMPTS` 次）；重问完仍缺席就**不发布**，题进 rejects 回炉——
+  没被检验过的题不能进数据集，但题也不会丢；
 - **覆盖率旁路文件**：每次运行写 `<out>.coverage.json`，报「池子多大 / 覆盖了多少 /
   还差多少 / 按本轮实测速度还要多久」，进度不靠人工抽检。
 """
@@ -62,10 +65,11 @@ WORDING_ONLY_KEYS = ("proof", "distractors")
 
 
 # 本机端点的并发上限。4060 Laptop 8GB：显存与显存带宽就是瓶颈，多开只会互相抢。
-# 实测（同一条生产路径，`--limit 4 --exclude synthesis/out`）：1 路 96.4 s/请求，
-# 2 路 10.5 s/请求（同一台机器上另有别的东西在吃显卡时，单路能掉到 96 s/请求）。
-# 短输出探针里 4 路的「2.9×」是 prompt 处理占比高造成的假象，长输出没有正收益。
-LOCAL_WORKER_CAP = 2
+# 上限 4 是端点自身的能力边界——本机服务端最多同时处理 4 路请求，再开就是排队。
+# 它是**封顶**不是「开满更快」：短输出探针实测 4 路并行墙钟 5.93 s，
+# 而 4 路串行合计只要 4.79 s，多开在这台机器上没有正收益。
+# 同一条生产路径（`--limit 4 --exclude synthesis/out`）实测：1 路 96.4 s/请求、2 路 10.5 s/请求。
+LOCAL_WORKER_CAP = 4
 
 
 def is_local_endpoint(base_url: str) -> bool:
@@ -206,9 +210,19 @@ def _offline_record(ziid: str, spec: TaskSpec, difficulty: Difficulty) -> dict:
         # 实时拦下的「题干问错方向」「题干泄结构」在 replay 里就会直接发布出去。
         "stem_asks_any": list(spec.stem_asks_any),
         "structure_words": list(spec.structure_words),
+        # 载荷白名单也要落盘：它是**措辞时发给模型的事实键**，丢了它回炉就会退回「整份 facts 全发」——
+        # 实测 T17 因此把 `source`（康熙字典）又发了过去，回炉那一条写成「根据《康熙字典》记载，…」，
+        # 而实时路径已经不发这个字段了。回炉路径不许比实时路径松（同 `stem_asks_any` 那条）。
+        "payload_facts": list(spec.payload_facts),
         "proof": list(spec.proof),
         "distractors": [{"text": d.text, "why_wrong": d.why_wrong} for d in spec.distractors],
-        "difficulty": difficulty_note(spec.task_id, difficulty, resolved_depth=spec.resolved_depth),
+        "difficulty": difficulty_note(
+            spec.task_id,
+            difficulty,
+            resolved_depth=spec.resolved_depth,
+            resolved_hops=spec.resolved_hops,
+            resolved_constraints=spec.resolved_constraints,
+        ),
         "provenance": dict(spec.provenance),
     }
 
@@ -240,6 +254,7 @@ def spec_from_record(row: Mapping[str, Any]) -> TaskSpec:
         hidden_subject=str(row.get("hidden_subject", "")),
         stem_asks_any=stem_asks_any,
         structure_words=tuple(str(item) for item in row.get("structure_words", ()) if item),
+        payload_facts=tuple(str(item) for item in row.get("payload_facts", ()) if item),
         proof=tuple(str(item) for item in row.get("proof", ())),
         distractors=tuple(
             Distractor(text=str(item.get("text", "")), why_wrong=str(item.get("why_wrong", "")))
@@ -252,11 +267,23 @@ def spec_from_record(row: Mapping[str, Any]) -> TaskSpec:
 
 AVOID_TAIL = 6
 
+# 模型侧检验（读者 / 裁判）的缺席重问次数。缺席 = 请求挂了 / 模型只吐思考段没吐 JSON /
+# 输出不是合法 JSON——那是**工具没干成活**，不是「这条数据不合格」，所以同一个问题重问，
+# 直到真的读出一个判定为止。重问完仍缺席就是**没过**（见 `_round_passed`）：
+# 没被检验过的题不发布，进 rejects 回炉，题不丢。
+CHECK_ATTEMPTS = 3
+
+# 缺席在 rejects / attempt-stats 里单列一个桶：它不是「被哪条防线否决」，
+# 而是「这条检验根本没跑成」——混进「往返检验否决」桶里会让人以为读者读了并说不行。
+ROUNDTRIP_ABSENT_KEY = "读者缺席"
+JUDGE_ABSENT_KEY = "裁判缺席"
+
 
 def _judge_vetoed(judgement: Any) -> bool:
     """输入：history 里落盘的 judge 判定（dict 或 None）。输出：是否被裁判真正否决。
-    预期：None / 非 dict = 没开裁判；`error` 非空 = 裁判自己跑挂了（缺席），**不算否决**；
-          只有 `ok` 为 False 且没有 error 才是真否决——不能因为裁判崩了就把好题判死。
+    预期：None / 非 dict = 没开裁判；只有 `ok` 为 False 且没有 error 才是真否决。
+          `error` 非空 = 裁判自己跑挂了（缺席）——那**既不是否决也不是通过**：调用方先重问
+          （`_judge_with_retries`），重问完仍缺席就不发布（`_round_passed`），题进 rejects 回炉。
     """
     if not isinstance(judgement, dict):
         return False
@@ -266,20 +293,91 @@ def _judge_vetoed(judgement: Any) -> bool:
 def _roundtrip_vetoed(roundtrip: Any) -> bool:
     """输入：history 里落盘的往返检验结果（dict 或 None）。输出：是否被往返检验真正否决。
 
-    预期：与裁判同一条规矩——`error` 非空是**缺席**（请求挂了 / 输出不合法），不否决；
-          只有「跑成了、且答出的答案与载荷里的定死答案对不上」才否决。
+    预期：只有「跑成了、且答出的答案与载荷里的定死答案对不上」才否决。
+          `error` 非空是**缺席**（请求挂了 / 只吐思考段 / 输出不是 JSON）——那既不是否决也不是
+          通过：调用方先重问（`_roundtrip_with_retries`），重问完仍缺席就不发布（`_round_passed`）。
     """
     if not isinstance(roundtrip, dict):
         return False
     return roundtrip.get("ok") is False and not roundtrip.get("error")
 
 
+def _roundtrip_absent(roundtrip: Any) -> bool:
+    """输入：history 里落盘的往返检验结果（dict 或 None）。输出：这次检验是不是**没跑成**。
+
+    预期：`None` = 这一轮根本没要求做这条检验（tier 不是 A，或 `--no-roundtrip`），不算缺席；
+          dict 且 `error` 非空 = 读者没读成。缺席**不是通过**——`_round_passed` 按没过处理。
+    """
+    if not isinstance(roundtrip, dict):
+        return False
+    return bool(roundtrip.get("error"))
+
+
+def _judge_absent(judgement: Any) -> bool:
+    """输入：history 里落盘的 judge 判定（dict 或 None）。输出：这次裁判是不是**没跑成**。
+
+    预期：与 `_roundtrip_absent` 同一条规矩——`None` 是没开裁判，dict 且 `error` 非空是缺席。
+    """
+    if not isinstance(judgement, dict):
+        return False
+    return bool(judgement.get("error"))
+
+
+def _roundtrip_with_retries(
+    client: ChatClient,
+    spec: TaskSpec,
+    verbalized: Verbalized,
+    *,
+    answer_judge: ChatClient | None = None,
+    subject_identified: bool | None = None,
+    attempts: int = CHECK_ATTEMPTS,
+) -> Any:
+    """输入：读者客户端 + TaskSpec + L3 产出 + 仲裁客户端 + 识别条件旁证 + 重问次数。输出：RoundTrip。
+
+    预期：**只对缺席重问**，重问的是同一道题、同一段文字——读者没读成是工具问题，不是这段文字
+          有问题，重新措辞只会白花配额。读者读出了判定（ok True/False）立刻返回；
+          重问次数用尽仍缺席时把最后一次（带 error）原样返回，由 `_round_passed` 判成没过。
+    """
+    result = roundtrip_answer(
+        client, spec, verbalized, answer_judge=answer_judge, subject_identified=subject_identified,
+    )
+    for _ in range(max(1, attempts) - 1):
+        if not result.absent:
+            return result
+        result = roundtrip_answer(
+            client, spec, verbalized, answer_judge=answer_judge, subject_identified=subject_identified,
+        )
+    return result
+
+
+def _judge_with_retries(
+    judge_client: ChatClient, spec: TaskSpec, verbalized: Verbalized, *, attempts: int = CHECK_ATTEMPTS,
+) -> Any:
+    """输入：裁判客户端 + TaskSpec + L3 产出 + 重问次数。输出：Judgement。
+
+    预期：与 `_roundtrip_with_retries` 同一条规矩——裁判缺席（网络错 / 输出不合法）就重问同一道题，
+          只有真的判出一个结论（放行 / 否决）才停；重问完仍缺席就不发布（见 `_round_passed`）。
+    """
+    result = judge_record(judge_client, spec, verbalized)
+    for _ in range(max(1, attempts) - 1):
+        if not result.absent:
+            return result
+        result = judge_record(judge_client, spec, verbalized)
+    return result
+
+
 def _round_passed(tier: Any, judgement: Any, roundtrip: Any = None) -> bool:
-    """输入：程序防线 tier + 裁判判定。输出：这一轮算不算通过。
+    """输入：程序防线 tier + 裁判判定 + 读者检验结果。输出：这一轮算不算通过。
     预期：**唯一的通过判据**——发布（`_publishable`）与事后汇总（`summarize_attempts`）共用，
           否则会出现「线上没发布、attempt-stats 却记成一次过」这种两套口径。
+          缺席（裁判 / 读者没跑成）**既不是否决也不是通过**：没被检验过的题不能发布，
+          所以缺席按没过算——它进 rejects 回炉，题不丢，也不会带着「没读过的题」进数据集。
     """
-    return tier == "A" and not _judge_vetoed(judgement) and not _roundtrip_vetoed(roundtrip)
+    if tier != "A":
+        return False
+    if _judge_vetoed(judgement) or _roundtrip_vetoed(roundtrip):
+        return False
+    return not _judge_absent(judgement) and not _roundtrip_absent(roundtrip)
 
 
 def _publishable(verification: Any, judgement: Any, roundtrip: Any = None) -> bool:
@@ -294,7 +392,7 @@ def _roundtrip_reason(roundtrip: Any) -> str:
     """输入：落盘的读者检验结果（dict）。输出：一条**中文**失败原因（进 rejects / attempt-stats）。
 
     预期：把「读者到底读出了什么」写清楚——只记一句「往返检验否决」的话，rejects 里看不出
-          这道题是被四条判据里的哪一条拦下的。给措辞模型的那一份是英文（见 `_roundtrip_feedback`）。
+          这道题是被四条判据里的哪一条拦下的。给措辞模型的那份见 `_roundtrip_feedback`。
     """
     note = str(roundtrip.get("note") or "")
     if roundtrip.get("is_question") is False:
@@ -303,7 +401,7 @@ def _roundtrip_reason(roundtrip: Any) -> str:
         return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干没说清问的是哪个字（{note or '读者认不出题目针对哪个字'}）"
     phrases = roundtrip.get("writer_phrases") or []
     if phrases:
-        return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干里夹着写给写题人的话 {list(phrases)}"
+        return f"{ROUNDTRIP_FEEDBACK_KEY}: 题干或解析里夹着写给写题人的话 {list(phrases)}"
     answer = str(roundtrip.get("answer") or "（答不出）")
     return f"{ROUNDTRIP_FEEDBACK_KEY}: 只凭题干答出的是「{answer}」，与标准答案不符"
 
@@ -311,32 +409,30 @@ def _roundtrip_reason(roundtrip: Any) -> str:
 def _roundtrip_feedback(spec: TaskSpec, roundtrip: Any) -> str:
     """输入：TaskSpec + 这一轮的读者检验结论（RoundTrip）。输出：回灌给措辞模型的反馈。
 
-    预期：**英文**——「程序侧文本一律英文」是既有的机制（见 verbalizer 模块注释），模型就抄不进
-          中文题干；实测中文反馈会被 2B 整段当成题干输出（「题干里夹着写给写作者的要求（…）」
-          原样进了 stem）。给人看的中文原因在 `_roundtrip_reason`，两份用途不同、各写各的。
+    预期：**中文**，且**不带闸门名**——回灌的是「读者读出了什么」，闸门名（「往返检验否决」）是
+          给 rejects 看的行话，塞进模型上下文只会被抄进产出。给人看的那份在 `_roundtrip_reason`
+          （带闸门名、进 rejects），两份用途不同、各写各的。反馈刻意用闸门会拦的词（题干 / 读者）
+          ——模型把反馈抄进产出即被 `no_internal_terms` 拦下。
     """
     if not roundtrip.is_question:
         return (
-            f"{ROUNDTRIP_FEEDBACK_KEY}: a reader found no question in the stem "
-            f"({roundtrip.note or 'no answer request is readable'}). The stem must ask the reader "
-            "something — write it as a question with a clear answer request, not as a statement "
-            "and not as a restatement of an instruction."
+            f"读者在题干里读不出问题（{roundtrip.note or '看不出要读者答什么'}）。"
+            "题干要向读者提问——写成一句问话，把作答要求交给读者，不要写成陈述句，"
+            "也不要把出题说明复述一遍。"
         )
     if not roundtrip.identifies_subject:
         return (
-            f"{ROUNDTRIP_FEEDBACK_KEY}: a reader could not tell which character the stem is about "
-            f"({roundtrip.note or 'the character never appears in the stem'}). Write the character "
-            "itself (or the whole candidate list) into the stem."
+            f"读者看不出题干问的是哪个字（{roundtrip.note or '那个字根本没在题干里出现'}）。"
+            "把那个字本身（或整份候选名单）写进题干。"
         )
     if roundtrip.writer_phrases:
         return (
-            f"{ROUNDTRIP_FEEDBACK_KEY}: the stem contains sentences addressed to the writer "
-            f"{list(roundtrip.writer_phrases)}. Delete them — the stem must contain the question only."
+            f"题干里夹着写给写题人的话 {list(roundtrip.writer_phrases)}。删掉——"
+            "题干里只留问题本身。"
         )
     return (
-        f"{ROUNDTRIP_FEEDBACK_KEY}: reading only the stem, a reader answered "
-        f"{roundtrip.answer or 'nothing'} while the intended answer is {spec.answer!r}. "
-        "Make the stem give the reader enough to reach that answer."
+        f"读者只凭题干答出的是「{roundtrip.answer or '什么也没答出'}」，"
+        f"而这道题的答案是「{spec.answer}」。把读者答出这个答案需要的条件补进题干。"
     )
 
 
@@ -352,6 +448,10 @@ def _round_reasons(tier: Any, failures: Any, judgement: Any, roundtrip: Any = No
     if not reasons and tier == "A" and _judge_vetoed(judgement):
         reason = str((judgement or {}).get("reason") or "未给理由")
         reasons.append(f"{JUDGE_FEEDBACK_KEY}: {reason}")
+    if not reasons and tier == "A" and _roundtrip_absent(roundtrip):
+        reasons.append(f"{ROUNDTRIP_ABSENT_KEY}: 读者没读成（{roundtrip.get('error')}）")
+    if not reasons and tier == "A" and _judge_absent(judgement):
+        reasons.append(f"{JUDGE_ABSENT_KEY}: 裁判没跑成（{judgement.get('error')}）")
     return reasons
 
 
@@ -364,10 +464,12 @@ def _better_round(history: list[dict], best: int, index: int) -> int:
     """
     def score(at: int) -> tuple[int, int, int]:
         row = history[at]
-        vetoed = _roundtrip_vetoed(row.get("roundtrip")) or _judge_vetoed(row.get("judge"))
+        # 「缺席」与「否决」在这条排序里同权：两者都意味着这一轮**没通过**，没通过的轮次
+        # 不该被当成最好的一轮——否则缺席的那轮会被选中，发布判据再从它身上取 roundtrip。
+        blocked = not _round_passed(row.get("tier"), row.get("judge"), row.get("roundtrip"))
         return (
             1 if row.get("tier") == "A" else 0,
-            0 if vetoed else 1,
+            0 if blocked else 1,
             -len(list(row.get("failures") or [])),
         )
 
@@ -409,13 +511,17 @@ def _verified_with_semantic_answer(
         return replace(verdict, semantic_answer=f"仲裁缺席（{error}）")
     if not stated:
         return replace(verdict, semantic_answer=f"LLM 仲裁：{reason or '解析没说清答案'}")
-    answer_note = f"The explanation never states the answer {spec.answer!r}. Write it in."
+    kept = [
+        (failure, note)
+        for failure, note in zip(verdict.failures, verdict.notes)
+        if not failure.startswith("answer_in_explanation")
+    ]
     return replace(
         verdict,
         answer_in_explanation=True,
         semantic_answer=f"LLM 仲裁：{reason or '解析说的就是标准答案'}",
-        failures=tuple(item for item in verdict.failures if not item.startswith("answer_in_explanation")),
-        notes=tuple(item for item in verdict.notes if item != answer_note),
+        failures=tuple(failure for failure, _ in kept),
+        notes=tuple(note for _, note in kept),
     )
 
 
@@ -451,13 +557,13 @@ def _verbalize_with_retries(
         verdict = _verified_with_semantic_answer(verify(spec, verbalized), spec, verbalized, answer_judge)
         judgement = None
         if judge_client is not None and verdict.tier == "A":
-            judgement = judge_record(judge_client, spec, verbalized)
+            judgement = _judge_with_retries(judge_client, spec, verbalized)
         # L4.6 往返检验：把（题干, 解析, 选项）交回模型答题，答案对不上载荷里定死的答案就否决。
         # 它只判**闭集**（答案由代码定死），所以弱模型也够用；它测的是「读者能不能读懂并答对」，
         # 那正是枚举措辞形状永远追不完的那件事。
         roundtrip = None
         if do_roundtrip and verdict.tier == "A":
-            roundtrip = roundtrip_answer(
+            roundtrip = _roundtrip_with_retries(
                 client, spec, verbalized, answer_judge=answer_judge,
                 subject_identified=subject_identified_by_gates(verdict),
             )
@@ -479,13 +585,15 @@ def _verbalize_with_retries(
             history[round_no]["chosen"] = True
             return verbalized, verdict, round_no + 1, history
         if verdict.failures:
-            # 回灌**英文**说法：中文失败原因会被 2B 整段抄进题干（实测「题干列出了…」
-            # 「请在提供的汉字中找出…」都是上一轮中文反馈的回声）。中文那份仍在 rejects 里。
+            # 回灌 `notes`（模型侧说法）而不是 `failures`（给人看的行话）：两份同序同长，`notes`
+            # 只讲「要改什么」，且刻意用 `no_internal_terms` 会拦的词——模型抄进产出即被拦下。
+            # `notes` 缺席（手工构造的 Verification）时才退回 `failures`。
             feedback = tuple(verdict.notes) or tuple(verdict.failures)
         elif _roundtrip_vetoed(roundtrip_dict):
             feedback = (_roundtrip_feedback(spec, roundtrip),)
         elif judgement is not None:
-            feedback = (f"{JUDGE_FEEDBACK_KEY}：{judgement.reason or '未给理由'}",)
+            # 同样不带闸门名：模型只需要「哪里不对」，闸门名是给 rejects 看的行话。
+            feedback = (judgement.reason or "裁判说这道题不合格，但没给理由。按上面的要求重写一遍。",)
         else:
             feedback = ()
     history[best]["chosen"] = True
@@ -527,7 +635,7 @@ def _verbalize_batch_with_retries(
             item = verbalized[position]
             verdict = _verified_with_semantic_answer(verify(specs[index], item), specs[index], item, answer_judge)
             roundtrip = (
-                roundtrip_answer(
+                _roundtrip_with_retries(
                     client, specs[index], item, answer_judge=answer_judge,
                     subject_identified=subject_identified_by_gates(verdict),
                 )
@@ -810,7 +918,9 @@ def _plan(
           用户看到的是静默空跑，这是最难排查的一类假成功。
           轮转取样时**优先挑还没用过的字**：同一个字能出多个题型，若每个题型都取桶里第一条，
           小批量就会全落在池子最前面那几个字上（实测 `--limit 16` 只覆盖 4 个字）。
-          优先取未用字后，题型覆盖与字覆盖同时铺开；桶里剩下的字都用过了才退而求其次。
+          优先取未用字后，题型覆盖与字覆盖同时铺开；为让位而跳过的候选**不丢**——它们进 `deferred`，
+          第一轮轮转结束后按桶序补齐。桶里每一条都是一个真实可出题的 (题型, 字) 组合，
+          静默丢掉就是数据集缺一块（实测 T17 因此少 10,314 条）。
     """
     cap = max(4, config.limit)
     skip = set(exclude)
@@ -841,6 +951,10 @@ def _plan(
     planned: list[tuple[Any, TaskSpec]] = []
     cursors = {task_id: 0 for task_id in buckets}
     used_ziids: set[str] = set()
+    # 让位候选：这一轮因为「这个字已经用过了」被跳过、暂时不取的候选。它们**不能丢**——
+    # 桶里每一条都是一个真实可出题的 (题型, 字) 组合。第一轮只负责「把字铺开」（小批量时
+    # 这就够了），第二轮把让位的按桶序补齐；`limit` 只在真不够时才切。
+    deferred: dict[str, list[tuple[Any, TaskSpec]]] = {task_id: [] for task_id in buckets}
     while len(planned) < config.limit:
         progressed = False
         for task_id in sorted(buckets):
@@ -848,17 +962,13 @@ def _plan(
                 break
             bucket = buckets[task_id]
             picked: tuple[Any, TaskSpec] | None = None
-            first_seen: tuple[Any, TaskSpec] | None = None
             while cursors[task_id] < len(bucket):
                 candidate = bucket[cursors[task_id]]
                 cursors[task_id] += 1
-                if first_seen is None:
-                    first_seen = candidate
                 if candidate[0].ziid not in used_ziids:
                     picked = candidate
                     break
-            if picked is None:
-                picked = first_seen  # 桶里剩下的字都用过了：凑满 limit 优先于字不重复
+                deferred[task_id].append(candidate)  # 让位，但不丢
             if picked is None:
                 continue
             planned.append(picked)
@@ -866,6 +976,14 @@ def _plan(
             progressed = True
         if not progressed:
             break
+    # 第二轮：补齐让位过的候选。字重复优于丢数据。
+    for task_id in sorted(deferred):
+        if len(planned) >= config.limit:
+            break
+        for candidate in deferred[task_id]:
+            if len(planned) >= config.limit:
+                break
+            planned.append(candidate)
     return planned, scanned, skipped_covered
 
 
@@ -1106,8 +1224,8 @@ def run_pipeline(
 
             def attempt(no: int, character: Any, spec: TaskSpec) -> tuple[Verbalized, Any, int, list[dict]]:
                 """输入：序号、字、TaskSpec。输出：(L3 产出, L4 结论, 实际尝试次数, 逐轮判定记录)。
-                预期：语体起点由 (seed, task_id, ziid) 的稳定哈希决定，与记录在计划里的位置无关——
-                      位置是固定的，拿它当起点会让同一个题型永远落在同一个语体上。
+                预期：负例（同题型最近发布过的题干，见 `avoid_for`）从发布进度现取，与这道题在计划
+                      里的位置无关——位置是固定的，拿它当起点会让同一题型永远看到同一批负例。
                 """
                 return _verbalize_with_retries(
                     client, spec, retries=config.retries, temperature=config.temperature,
@@ -1164,7 +1282,7 @@ def run_pipeline(
 
             def attempt_chunk(unit: list[tuple[int, Any, TaskSpec]]) -> list[tuple[Verbalized, Any, int, list[dict]]]:
                 """输入：一批 (序号, 字, TaskSpec)。输出：与单元等长、顺序一致的结果。
-                预期：整批一次请求；语体起点取这一批第一题的序号，与单题路径同规则。
+                预期：整批一次请求；批量路径不收 `avoid`（负例是按题给的），其余打包方式与单题同。
                 """
                 return _verbalize_batch_with_retries(
                     client, [spec for _no, _character, spec in unit],
@@ -1450,6 +1568,47 @@ def replay_rejects(
     return stats
 
 
+def auto_replay(
+    replay: Callable[[Path], Mapping[str, Any]],
+    rejects_path: Path,
+    *,
+    max_rounds: int,
+    say: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """输入：单轮回炉函数 + 起始 rejects 文件 + 最多轮数 + 进度回调。输出：逐轮统计（去掉起止时刻）。
+    预期：L7 自动回炉的**唯一收敛判据是「这一轮有没有新救回」**——
+          - 起始文件不存在 → 一轮都不跑；
+          - `planned == 0`（没有可回炉的样本）→ 停；
+          - `recovered == 0` → 停：同一批输入 + 同一温度 + 没有状态变化，再喂一遍只会复现
+            同一批失败（实测 live_r18 就是这样空转的，白烧配额）；
+          - `recovered > 0` 才把残留文件当下一轮输入，最多 `max_rounds` 轮。
+          残留样本一条都不丢：每一轮的残留都由 `replay` 写进 `<x>.replayed.jsonl`。
+    """
+    say = say or (lambda _msg: None)
+    current = Path(rejects_path)
+    rounds: list[dict[str, Any]] = []
+    for round_no in range(1, max_rounds + 1):
+        if not current.exists():
+            break
+        say(f"自动回炉 第 {round_no} 轮：{current}")
+        one = dict(replay(current))
+        rounds.append({k: v for k, v in one.items() if k not in {"started", "finished"}})
+        if int(one.get("planned") or 0) == 0:
+            say(f"自动回炉 第 {round_no} 轮：没有可回炉的样本，停")
+            break
+        if int(one.get("recovered") or 0) == 0:
+            say(
+                f"自动回炉 第 {round_no} 轮：一条都没救回，停"
+                f"（剩余 {one.get('still_failed', 0)} 条留在 {one.get('left_path')}）"
+            )
+            break
+        left = one.get("left_path")
+        if not left:
+            break
+        current = Path(str(left))
+    return rounds
+
+
 def _reject_defense(failure: str) -> str:
     """输入：一条失败原因（形如 `防线名: 说明`）。输出：防线名。
     预期：没有冒号的旧格式整条当防线名，绝不因为格式不认识就丢样本。
@@ -1491,7 +1650,7 @@ def summarize_rejects(rejects_path: Path) -> dict:
     """输入：`.rejects.jsonl` 路径（也可直接给 `.replayed.jsonl`）。输出：只读汇总 dict。
     预期：**一个字节都不改**——rejects 只增不删，这里只把「死在哪个防线、哪个题型」数出来。
           存在同级 `<文件名>.replayed.jsonl` 时一并汇总到 `replayed` 字段：那是回炉后**仍失败**
-          的样本，所以它的 by_defense 是「换过语体、回过原因之后还过不去的硬骨头」。
+          的样本，所以它的 by_defense 是「换过措辞、回过原因之后还过不去的硬骨头」。
     """
     path = Path(rejects_path)
     if not path.exists():

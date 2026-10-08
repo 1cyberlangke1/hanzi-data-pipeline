@@ -116,6 +116,43 @@ class CodepointTaskTests(unittest.TestCase):
                 self.assertIn(spec.facts["codepoint"], allowed)
                 self.assertIn(spec.visible_subject, allowed)
 
+    def test_payload_codepoint_forms_are_self_identifying_only(self) -> None:
+        """发给模型的 `codepoint_forms` 只能是**自明**的码点写法：带 `U+` 前缀的十六进制、十进制。
+
+        预期：两条排除理由——① UTF-8 字节序列不是码位，混进去时 2B 会写「给出码位 E3 90 8B」
+              （主人点名过）；② 裸十六进制（`4E00`）与十进制（`19968`）在文本里长得一样，
+              混进去时产出会写成「码位 4E00」——同一个词时而指十六进制时而指十进制，
+              实测 T14 有 15,085 条解析、T16 有 45,157 条题干是这么写的。
+        """
+        from hanzi_synth.llm.verbalizer import payload_for
+
+        numeric = ["U+4E00", "19968"]
+        for spec in (
+            build_unicode_codepoint(YI, rng=random.Random(3), difficulty=Difficulty(), index=SMALL_INDEX),
+            build_unicode_reverse(YI, rng=random.Random(3), difficulty=Difficulty(), index=SMALL_INDEX),
+        ):
+            assert spec is not None
+            forms = payload_for(spec)["facts"]["codepoint_forms"]
+            self.assertEqual(forms, numeric, spec.task_id)
+            self.assertNotIn("E4 B8 80", forms, spec.task_id)
+            self.assertNotIn("4E00", forms, spec.task_id)
+
+    def test_shown_codepoint_is_never_the_bare_hex(self) -> None:
+        """T14 主答案 / T16 题干码位一律**自明**（带 `U+` 或纯十进制），裸十六进制只进判分集合。
+
+        预期：40 个种子下都不出现 `4E00`——它既像十进制又像十六进制，「码位 4E00」这种句子
+              读者按十进制读会读到别的码位；但它仍然是合法答案（`accepted` 里留着）。
+        """
+        self.assertIn("4E00", build_unicode_codepoint(
+            YI, rng=random.Random(3), difficulty=Difficulty(), index=SMALL_INDEX
+        ).accepted)
+        for seed in range(40):
+            with self.subTest(seed=seed):
+                spec = build_unicode_codepoint(YI, rng=random.Random(seed), difficulty=Difficulty(), index=SMALL_INDEX)
+                assert spec is not None
+                self.assertNotEqual(spec.answer, "4E00")
+                self.assertTrue(spec.answer.startswith("U+") or spec.answer.isdigit(), spec.answer)
+
     def test_reverse_needs_enough_neighbours(self) -> None:
         """凑不满 3 个选项（两选一是抛硬币）就不出题。"""
         lonely = make_index([YI, ER])

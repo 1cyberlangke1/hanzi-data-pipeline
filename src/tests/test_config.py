@@ -28,6 +28,9 @@ base_url = "https://judge.example.com/v1"
 model = "m2"
 api_key = "sk-2"
 role = "judge"
+
+[providers.extra_body]
+enable_thinking = false
 """
 
 
@@ -46,9 +49,10 @@ class LoadProvidersTests(unittest.TestCase):
         self.assertEqual(providers[0].rpm, 12)
         self.assertEqual(providers[0].batch, 2)
         self.assertEqual(providers[1].rpm, 0)
-        # 请求侧关思考开关是**配置**：配了就带出来，没配就是空串（请求体里不发这个字段）
-        self.assertEqual(providers[0].reasoning_effort, "none")
-        self.assertEqual(providers[1].reasoning_effort, "")
+        # 请求体透传字段是**配置**：`[providers.extra_body]` 表与顶层 `reasoning_effort`
+        # 两种写法都收；没配就是空表（请求体里一个多余字段都不发）
+        self.assertEqual(providers[0].extra_body, {"reasoning_effort": "none"})
+        self.assertEqual(providers[1].extra_body, {"enable_thinking": False})
 
     def test_role_filter(self) -> None:
         """role 过滤只留下匹配的 provider。"""

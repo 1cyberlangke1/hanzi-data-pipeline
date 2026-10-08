@@ -16,24 +16,22 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..tasks.base import Difficulty
+from ..tasks.base import CONSTRAINT_TASKS, HOP_TASKS, Difficulty
 from .dedup import load_jsonl
 
 # 默认等价分支数：一条题面把答案锁定在「1 个正确 + K 个等价干扰」里
 DEFAULT_BRANCHES = 4
-# 真正消费 hops 的题型（其余题型 hops 不生效，注记里如实写 1）
-HOP_TASKS: tuple[str, ...] = ("T9_component_chain", "T12_ids_transform")
-# 真正消费 constraints 的题型
-CONSTRAINT_TASKS: tuple[str, ...] = ("T8_constraint",)
+# `HOP_TASKS` / `CONSTRAINT_TASKS` 定义在 tasks/base.py——难度阶梯要在 `build_all` 里展开，
+# 而 tasks 层不能反向依赖 pipeline 层。这里只做再导出，判据只有一份。
 
 
-def branches_for(task_id: str, difficulty: Difficulty) -> int:
-    """输入：题型 ID + 难度设定。输出：该题型的等价分支数 K。
+def branches_for(task_id: str, constraints: int) -> int:
+    """输入：题型 ID + 该题型的**已落定**约束个数。输出：该题型的等价分支数 K。
     预期：T8 的 K = 约束个数（见 `target_facility` 对方向的解释），其余题型用默认值。
           只认已知题型，未知题型按默认值处理，不抛错。
     """
     if task_id in CONSTRAINT_TASKS:
-        return max(1, difficulty.constraints)
+        return max(1, int(constraints))
     return DEFAULT_BRANCHES
 
 
@@ -53,19 +51,33 @@ def target_facility(*, hops: int = 1, branches: int = DEFAULT_BRANCHES) -> float
     return round(1.0 - (1.0 - single_hop) ** hops, 6)
 
 
-def difficulty_note(task_id: str, difficulty: Difficulty, *, resolved_depth: str = "") -> dict:
-    """输入：题型 ID + 难度设定 + 本条实际用到的干扰项档位（可空）。输出：写进产出的难度注记。
+def difficulty_note(
+    task_id: str,
+    difficulty: Difficulty,
+    *,
+    resolved_depth: str = "",
+    resolved_hops: int | None = None,
+    resolved_constraints: int | None = None,
+) -> dict:
+    """输入：题型 ID + 难度设定 + 本条实际用到的干扰项档位 / 跳数 / 约束个数（都可空）。
+    输出：写进产出的难度注记。
     预期：把「哪些旋钮真的作用于这个题型」和解析式期望通过率一起记下来，
           让每条产出自带可比较的标尺；不生效的旋钮写 None，不假装它起作用。
-          `distractor_depth` 写**真实用到的档位**（`mixed` 抽成具体档之后的结果），
-          `depth_mode` 保留配置值——这样既看得出这条题多难，也看得出它是抽样来的。
+          `distractor_depth` / `hops` / `constraints` 写**真实用到的值**（`mixed` 抽成具体档、
+          难度阶梯退档之后的结果），对应的 `*_mode` 保留配置档——这样既看得出这条题多难，
+          也看得出它是抽样 / 退档来的。
     """
-    hops = difficulty.hops if task_id in HOP_TASKS else 1
-    branches = branches_for(task_id, difficulty)
+    hops = resolved_hops if resolved_hops is not None else difficulty.hops
+    hops = int(hops) if task_id in HOP_TASKS else 1
+    constraints = resolved_constraints if resolved_constraints is not None else difficulty.constraints
+    constraints = int(constraints) if task_id in CONSTRAINT_TASKS else None
+    branches = branches_for(task_id, constraints if constraints is not None else DEFAULT_BRANCHES)
     return {
         "kind": "analytic-prior",
         "hops": hops,
-        "constraints": difficulty.constraints if task_id in CONSTRAINT_TASKS else None,
+        "hops_mode": difficulty.hops if task_id in HOP_TASKS else None,
+        "constraints": constraints,
+        "constraints_mode": difficulty.constraints if task_id in CONSTRAINT_TASKS else None,
         "distractor_depth": resolved_depth or difficulty.distractor_depth,
         "depth_mode": difficulty.distractor_depth,
         "branches": branches,

@@ -1,4 +1,4 @@
-"""关系与溯源类构造器（T5 / T6 / T7）的单元测试。"""
+"""关系与溯源类构造器（T5 / T6）的单元测试。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import unittest
 
 from hanzi_synth.tasks.base import Difficulty
 from hanzi_synth.tasks.relations import (
-    build_meaning_source,
     build_reference,
     build_standard_form,
     build_variant,
@@ -90,33 +89,6 @@ class ReferenceTests(unittest.TestCase):
         """页数非法时不出题。"""
         character = make_character(zi="\u3400", refs={"zh": {"page": 0, "number": 0}})
         self.assertIsNone(build_reference(character, rng=random.Random(1), difficulty=D, index=make_index([character])))
-
-
-class MeaningSourceTests(unittest.TestCase):
-    def test_single_source_is_unambiguous(self) -> None:
-        """三本库里恰好一本有释义 -> 答案唯一。"""
-        character = make_character(zi="\u3400", meanings={"mean_h": ["\u62fc\u97f3yi1<br>\u8868\u793a\u4e00"]})
-        spec = build_meaning_source(character, rng=random.Random(1), difficulty=D, index=make_index([character]))
-        assert spec is not None
-        self.assertEqual(spec.answer, "\u4e2d\u534e\u5b57\u6d77")
-        self.assertEqual(len(spec.distractors), 2)
-
-    def test_zero_sources_skipped(self) -> None:
-        """一本都没有 -> 没材料。"""
-        character = make_character(zi="\u3400", meanings={"mean_z": ["\u7efc\u5408\u91ca\u4e49"]})
-        self.assertIsNone(build_meaning_source(character, rng=random.Random(1), difficulty=D, index=make_index([character])))
-
-    def test_two_sources_skipped_as_ambiguous(self) -> None:
-        """两本都有 -> 题目有歧义，丢弃。"""
-        character = make_character(zi="\u3400", meanings={"mean_h": ["\u5b57\u6d77\u91ca\u4e49"], "mean_k": ["\u5eb7\u7199\u91ca\u4e49"]})
-        self.assertIsNone(build_meaning_source(character, rng=random.Random(1), difficulty=D, index=make_index([character])))
-
-    def test_never_quotes_meaning_text(self) -> None:
-        """选项只有书名，facts 里不含任何释义原文（边界要求）。"""
-        character = make_character(zi="\u3400", meanings={"mean_h": ["\u62fc\u97f3yi1<br>\u8fd9\u662f\u4e00\u6bb5\u539f\u6587\u91ca\u4e49"]})
-        spec = build_meaning_source(character, rng=random.Random(1), difficulty=D, index=make_index([character]))
-        assert spec is not None
-        self.assertNotIn("\u539f\u6587\u91ca\u4e49", str(spec.facts))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from hanzi_synth.llm.roundtrip import (
     answer_matches,
     build_roundtrip_messages,
     build_states_answer_messages,
+    build_writing_messages,
     explanation_states_answer,
     reader_answer_ok,
     roundtrip_answer,
@@ -161,24 +162,143 @@ class VerbalizeTests(unittest.TestCase):
         messages = build_messages(self.spec)
         self.assertNotIn("api_key", messages[1]["content"])
 
-    def test_visible_subject_gets_a_dedicated_payload_slot(self) -> None:
-        """必现串单列成 `stem_must_contain` 列表：埋在散文说明里小模型会漏（实测首轮 6 拒 5 中招）。"""
+    def test_payload_keeps_only_what_the_model_needs(self) -> None:
+        """载荷只放写这道题真正需要的字段，空值字段一律不出现。
+
+        预期：最朴素的一道题（有 instruction / facts / answer、没有候选也没有隐藏主语）
+              就这几个键——小模型的上下文很贵，塞进去的空槽位只会干扰它。
+        """
         spec = TaskSpec(task_id="T14_unicode_codepoint", instruction="i",
                         facts={"zi": "\u3400"}, answer="U+3400", visible_subject="\u3400")
         payload = payload_of(build_messages(spec))
-        self.assertEqual(payload["stem_must_contain"], ["\u3400"])
-        empty = payload_of(build_messages(self.spec))
-        self.assertEqual(empty["stem_must_contain"], [])
+        self.assertEqual(set(payload), {"instruction", "facts", "answer"})
 
-    def test_choice_options_are_hard_constraints_too(self) -> None:
-        """选择题的候选也得进 `stem_must_contain`：只写在散文说明里，模型会写出
+    def test_payload_sends_only_declared_facts(self) -> None:
+        """载荷 facts 只发 `spec.payload_facts` 声明的键。
+
+        预期：构造器的 `facts` 是给闸门 / 离线渲染用的**全集**（判分要读它、模板要读它），
+              措辞模型只需要「写这道题要引用的那几个值」。不裁剪时模型会拿别的题的材料当素材
+              ——实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，产出写成
+              「给出码位 E3 90 8B，让读者从下列选项中选出对应的字」。
+        """
+        spec = TaskSpec(task_id="T1_stroke_total", instruction="i",
+                        facts={"zi": "\u597d", "stroke_total": 6, "radical": "\u5973",
+                               "ids": ["\u2ff0\u5973\u5b50"]},
+                        answer="6", payload_facts=("zi", "stroke_total"))
+        payload = payload_of(build_messages(spec))
+        self.assertEqual(set(payload["facts"]), {"zi", "stroke_total"})
+
+    def test_undeclared_payload_facts_send_everything(self) -> None:
+        """没声明 `payload_facts` 的 spec（手工构造的、老测试用的）保持原行为：facts 全发。
+
+        预期：注册题型一律显式声明，这条兜的是 `payload_facts` 默认值那条路——默认值不能是
+              「什么都不发」，否则手工构造的 spec 会静默变成空载荷。
+        """
+        spec = TaskSpec(task_id="T_test", instruction="i", facts={"alpha": 1, "beta": 2}, answer="1")
+        payload = payload_of(build_messages(spec))
+        self.assertEqual(set(payload["facts"]), {"alpha", "beta"})
+
+    def test_payload_drops_facts_already_given_at_top_level(self) -> None:
+        """载荷不重复顶层已经给过的信息：facts 里的 options / nswer_zi 同值就去掉。
+
+        预期：顶层 options 是**占位符化**过的那一份；facts 里再留一份原始生僻字，2B 会照那份写
+              题干，绕开回填。只在**同值**时去掉——facts 里那份不一样就留着，不替模型猜。
+        """
+        spec = TaskSpec(task_id="T11_stroke_extreme", instruction="i",
+                        facts={"options": ["\u3400", "\u597d"], "answer_zi": "\u3400",
+                               "strokes": {"\u3400": 5, "\u597d": 6}},
+                        answer="\u3400", options=("\u3400", "\u597d"))
+        payload = payload_of(build_messages(spec))
+        self.assertEqual(set(payload["facts"]), {"strokes"})
+        # 整份载荷同一套记号：答案也是记号，回填后才是真字。
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        aliases = _alias_map(spec)
+        self.assertEqual(_restore_aliases(payload["answer"], aliases), "\u3400")
+        self.assertIn("options", payload)
+
+        # 与顶层不同值的那份留着：不做「按键名一律删」的猜测。
+        odd = TaskSpec(task_id="T11_stroke_extreme", instruction="i",
+                       facts={"options": ["\u3400"], "answer_zi": "\u597d"},
+                       answer="\u3400", options=("\u3400", "\u597d"))
+        kept = payload_of(build_messages(odd))
+        # 载荷里的生僻字一律是记号，比对前先回填。
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        odd_aliases = _alias_map(odd)
+        self.assertEqual(
+            [_restore_aliases(item, odd_aliases) for item in kept["facts"]["options"]], ["\u3400"]
+        )
+        self.assertEqual(_restore_aliases(kept["facts"]["answer_zi"], odd_aliases), "\u597d")
+
+    def test_choice_options_reach_the_model(self) -> None:
+        """选择题的候选必须原样进载荷的 `options`：模型看不到候选就会写出
         「下面是一些有趣的汉字。请问总笔画数最少的是哪一个？」这种一个候选都没列的废题
         （实测 16b 的 T11 就是这样）。"""
         spec = TaskSpec(task_id="T11_stroke_extreme", instruction="i",
                         facts={"zi": "\u3402"}, answer="\u3402",
                         options=("\u3402", "\u597d"))
         payload = payload_of(build_messages(spec))
-        self.assertEqual(payload["stem_must_contain"], ["\u3402", "\u597d"])
+        # 生僻字会换成 `[[1]]` 这类代号（产出前由程序回填），所以按「回填后」比对。
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        aliases = _alias_map(spec)
+        self.assertEqual(
+            [_restore_aliases(item, aliases) for item in payload["options"]],
+            list(spec.options),
+        )
+
+    def test_instruction_rare_chars_become_placeholders(self) -> None:
+        """说明里的生僻字与候选同处理：换成 `[[n]]` 占位符，产出前由程序回填。
+
+        预期：说明是题干的主要来源（候选 / 位置链 / 读音本来就写在说明里），模型照抄说明时
+              不该自己去敲生僻字——敲错就是另一道题。常用字（`好`）不动。
+        """
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        spec = TaskSpec(task_id="T10_odd_one_out", instruction="\u3400\u3001\u597d 里部首不同的那个字",
+                        facts={}, answer="\u3400", options=("\u3400", "\u597d"))
+        payload = payload_of(build_messages(spec))
+        self.assertNotIn("\u3400", payload["instruction"])
+        self.assertIn("\u597d", payload["instruction"])
+        self.assertEqual(_restore_aliases(payload["instruction"], _alias_map(spec)), spec.instruction)
+
+    def test_instruction_keeps_the_subject_verbatim(self) -> None:
+        """整份载荷（说明 / 候选 / 答案 / facts）用**同一套记号**，回填后与 TaskSpec 逐字段一致。
+
+        预期：只给候选取记号、facts 里留真字时，2B 无从对照，会写出自相矛盾的解析
+              （实测 T11 产出「笔画最少的是𡲗，对应字是㐂」——「𡲗」是它瞎挑的候选，
+              「㐂」是从 answer 抄的）。同一套记号它才分得清哪个是答案。
+        """
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        spec = TaskSpec(task_id="T11_stroke_extreme", instruction="\u3400\u3001\u597d 里笔画最少的那个字",
+                        facts={"strokes": {"\u3400": 5, "\u597d": 6}}, answer="\u3400",
+                        options=("\u3400", "\u597d"))
+        payload = payload_of(build_messages(spec))
+        aliases = _alias_map(spec)
+        self.assertEqual(_restore_aliases(payload["instruction"], aliases), spec.instruction)
+        self.assertEqual(_restore_aliases(payload["answer"], aliases), spec.answer)
+        self.assertEqual(
+            {_restore_aliases(key, aliases): value for key, value in payload["facts"]["strokes"].items()},
+            spec.facts["strokes"],
+        )
+
+    def test_loose_placeholder_spacing_is_restored(self) -> None:
+        """模型把记号写松了（`[[4] ]` / `[[ 4 ]]`）也要能回填成真字。
+
+        预期：实测（`probe_noinstr.jsonl` 的 T10 U03402）产出里多了一个空格，占位符就原样落进
+              题干、被闸门判 tier C 打回——那条数据本来是对的，白扔一次重试。记号之外的方括号
+              一律不动，免得把正文里的普通方括号吃掉。
+        """
+        from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
+
+        spec = TaskSpec(task_id="T10_odd_one_out", instruction="i", facts={}, answer="\u3400",
+                        options=("\u3400", "\u597d"))
+        aliases = _alias_map(spec)
+        self.assertEqual(_restore_aliases("[[1] ] 是哪一个？", aliases), "\u3400 是哪一个？")
+        self.assertEqual(_restore_aliases("[[ 1 ]] 是哪一个？", aliases), "\u3400 是哪一个？")
+        self.assertEqual(_restore_aliases("[1] 与 [[x]]", aliases), "[1] 与 [[x]]")
 
     def test_feedback_is_appended_as_an_extra_user_turn(self) -> None:
         """reflexion：反馈是**追加**的一条 user 消息，载荷本身不被改写。"""
@@ -208,7 +328,7 @@ class BatchTests(unittest.TestCase):
         items = batch_items_of(build_batch_messages(self.specs))
         self.assertEqual([item["id"] for item in items], [1, 2, 3])
         self.assertEqual([item["answer"] for item in items], ["1", "2", "3"])
-        self.assertEqual(items[0]["stem_must_contain"], [])
+        self.assertNotIn("options", items[0])
 
     def test_results_are_matched_by_id_not_position(self) -> None:
         """结果按 id 对齐：模型把顺序打乱也不串位，缺项只让那一道失败。"""
@@ -240,8 +360,8 @@ class BatchTests(unittest.TestCase):
         ]}, ensure_ascii=False)
         out = verbalize_batch(FakeClient([ok_completion(text)]), self.specs)
         self.assertTrue(out[0].ok)
-        self.assertIn("\u7f3a\u5c11 stem", out[1].error or "")
-        self.assertIn("\u7f3a\u5c11 explanation", out[2].error or "")
+        self.assertIn("\u7f3a\u5c11 Q", out[1].error or "")
+        self.assertIn("\u7f3a\u5c11 A", out[2].error or "")
 
     def test_batch_output_without_results_array_fails_every_item(self) -> None:
         """模型只回一个对象、没有 results 数组时，整批同错，而不是「第一道当结果」。"""
@@ -350,15 +470,16 @@ class ChatClientTests(unittest.TestCase):
         self.assertNotIn("max_tokens", captured)
         self.assertEqual(set(captured), {"model", "messages", "temperature"})
 
-    def test_reasoning_effort_is_sent_only_when_configured(self) -> None:
-        """provider 配了 `reasoning_effort` 才发这个字段。
+    def test_extra_body_is_sent_only_when_configured(self) -> None:
+        """provider 配了 `extra_body` 才把这些字段并进请求体。
 
         预期：没配 = 请求体里没有它（不认这个字段的端点不会因为未知字段吃 400）；
-              配了 = 原样带上。实测本地 LM Studio 靠它把往返检验从 325 秒压到 0.6 秒。
+              配了 = 字段名与取值**原样**带上，代码不做任何适配（各家的思考开关名字不一样）。
+              实测本地 LM Studio 靠 `reasoning_effort = "none"` 把往返检验从 325 秒压到 0.6 秒。
         """
         plain = ProviderConfig(name="p1", base_url="http://p1.test/v1", model="m", api_key="k", rpm=0)
         capped = ProviderConfig(name="p2", base_url="http://p2.test/v1", model="m", api_key="k", rpm=0,
-                                reasoning_effort="none")
+                                extra_body={"reasoning_effort": "none"})
         captured: list[dict] = []
 
         def fake_post(url, headers=None, json=None, timeout=None):
@@ -390,7 +511,7 @@ class JudgeTests(unittest.TestCase):
 
         return TaskSpec(
             task_id="T_test",
-            instruction="Ask the reader for the code point of the character.",
+            instruction="问这个字的码位",
             facts={"zi": "㐀", "codepoint_forms": ["U+3400", "13312"]},
             answer="U+3400",
             options=("U+3400", "U+3401"),
@@ -445,23 +566,31 @@ class JudgeTests(unittest.TestCase):
         self.assertTrue(judgement.ok)
         self.assertFalse(judgement.absent)
 
-    def test_criteria_are_the_single_source_for_both_prompts(self) -> None:
-        """判据只有一处定义：裁判提示词与**措辞提示词**都必须由 JUDGE_CRITERIA 生成——
-        回答的模型不知道裁判按什么判，就会在同一个地方反复被否决。
+    def test_criteria_live_only_in_the_judge_prompt(self) -> None:
+        """判据只在**裁判**提示词里，不塞进措辞提示词。
+
+        预期：措辞提示词保持短（小模型的上下文很贵，规则越多越顾此失彼）；
+              裁判按 JUDGE_CRITERIA 逐条判，措辞模型只管把题写自然。
         """
         from hanzi_synth.llm.judge import JUDGE_SYSTEM_PROMPT
         from hanzi_synth.llm.verbalizer import SYSTEM_PROMPT
         from hanzi_synth.verify.checks import JUDGE_CRITERIA
 
-        self.assertEqual(len(JUDGE_CRITERIA), 4)
+        # 判据名逐条列出来：历史上这里写死过条数 4，加了第五条判据后没人同步，测试一直红着。
+        self.assertEqual(
+            [name for name, _text in JUDGE_CRITERIA],
+            ["self_sufficient", "unambiguous", "explanation_clear", "asks_a_question", "natural_wording"],
+        )
         # 反向题（给读音/释义问字形）按设计不写那个字：判据必须写明不能因此判有歧义，
         # 否则裁判会把每一道合法的反向题都否掉。
         criteria = dict(JUDGE_CRITERIA)
         self.assertIn("反向题", criteria["unambiguous"])
-        self.assertIn("不要求 `stem` 写出答案本身", criteria["self_sufficient"])
+        # 判据原文后来改写过（「不要求 `stem` 写出答案本身」→「不必把答案本身写出来」），
+        # 这条断言跟着原文走，别写死旧句子。
+        self.assertIn("不必把答案本身写出来", criteria["self_sufficient"])
         for _name, text in JUDGE_CRITERIA:
             self.assertIn(text, JUDGE_SYSTEM_PROMPT)
-            self.assertIn(text, SYSTEM_PROMPT)
+            self.assertNotIn(text, SYSTEM_PROMPT)
 
     def test_judgement_dict_keeps_the_judging_model(self) -> None:
         """落盘的判定必须带 provider / model：换了裁判模型 κ 就是另一个数，
@@ -551,6 +680,25 @@ class PromptInvariantTests(unittest.TestCase):
             ):
                 self.assertNotIn(term, text, f"{label} 里出现了可抄的内部词 {term!r}")
 
+    def test_demo_turns_are_not_mistaken_for_the_real_payload(self) -> None:
+        """示范轮次里也有一份形状相同的输入 JSON：`payload_of` 必须跳过它。
+
+        预期：单题取到的是**这一次**的载荷；批量模式没有单题载荷，仍返回空字典。
+        """
+        spec = TaskSpec(task_id="T_test", instruction="i", facts={"zi": "好"}, answer="6")
+        messages = build_messages(spec)
+        self.assertGreater(len(messages), 3, "示范轮次应当真的进了 messages")
+        # 角色序列由**示范条数**推出来（示范不少于两条是实测下限：砍成一条时 A 会写成光秃答案）。
+        # 缺了这条断言，消息被拼坏（system 重复、示范粘在同一行、载荷排到示范前面）时全量单测照样全绿。
+        from hanzi_synth.llm.verbalizer import FEW_SHOT_TURNS
+
+        self.assertGreaterEqual(len(FEW_SHOT_TURNS), 2, "示范条数不能低于实测下限两条")
+        expected = ["system"] + ["user", "assistant"] * len(FEW_SHOT_TURNS) + ["user"]
+        self.assertEqual([message["role"] for message in messages], expected)
+        self.assertEqual([message["role"] for message in build_batch_messages([spec])], expected)
+        self.assertEqual(payload_of(messages)["answer"], "6")
+        self.assertEqual(payload_of(build_batch_messages([spec])), {})
+
     def test_payload_carries_avoid_openings(self) -> None:
         """`avoid_openings` 是**负例**：同题型已经用过的开头喂回去，模型才知道要换一种说法。"""
         from hanzi_synth.llm.verbalizer import payload_for
@@ -559,7 +707,8 @@ class PromptInvariantTests(unittest.TestCase):
         spec = TaskSpec(task_id="T_test", instruction="i", facts={}, answer="a")
         payload = payload_for(spec, ("请问", "下面"))
         self.assertEqual(payload["avoid_openings"], ["请问", "下面"])
-        self.assertEqual(payload_for(spec)["avoid_openings"], [])
+        # 没有已用过的开头时这个键根本不出现——空槽位不进模型的上下文。
+        self.assertNotIn("avoid_openings", payload_for(spec))
 
     def test_arbiter_prompt_separates_writing_style_from_values(self) -> None:
         """仲裁提示必须写清「只差分隔符 / 大小写才是等价，值不同就是不等价」。
@@ -580,11 +729,28 @@ class RoundTripTests(unittest.TestCase):
         return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="㐑",
                         answer_aliases=("E3 90 91",))
 
-    @staticmethod
-    def _client(text: str):
+    # 措辞检验（第二次请求）的默认回复：一句意见都没有。绝大多数用例只关心第一次读题的判定，
+    # 所以默认给「没意见」，让 `_client(text)` 保持单参数的老用法。
+    _NO_WRITING_OPINION = '{"phrases": [], "note": ""}'
+
+    @classmethod
+    def _client(cls, text: str, writing: str | None = None):
+        """输入：第一次（读题干）的回复 + 可选的第二次（措辞检验）回复。输出：鸭子类型客户端。
+
+        预期：两次调用各吐各的；不给第二次时默认「没意见」。`calls` 记下真正发了几次请求——
+        「其余判据已否决就不再发第二次」这条省配额的规矩靠它来钉。
+        """
+        replies = [text, cls._NO_WRITING_OPINION if writing is None else writing]
+
         class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def complete(self, messages, *, temperature: float = 0.6, extra=None):
-                return Completion(ok=True, text=text, provider="p", model="m")
+                self.calls += 1
+                reply = replies[self.calls - 1] if self.calls <= len(replies) else replies[-1]
+                return Completion(ok=True, text=reply, provider="p", model="m")
+
         return _Client()
 
     @staticmethod
@@ -663,6 +829,37 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(result.writer_phrases, ("请列出所有候选",))
         self.assertFalse(result.absent)
 
+    def test_writer_phrases_in_explanation_are_vetoed(self) -> None:
+        """解析里夹带写给写题人的话（自证 / 推托）→ 否决。
+
+        实测漏网原句：「证明这个分解方式是正确的」「具体含义需根据上下文判断」——题干干净、
+        答案也在解析里，机械闸门一条都拦不住；这只有把解析读一遍才判得了。
+        """
+        client = self._client('{"answer": "㐑"}', '{"phrases": ["证明这个分解方式是正确的"]}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.writer_phrases, ("证明这个分解方式是正确的",))
+        self.assertFalse(result.absent)
+
+    def test_writing_scan_absent_is_not_a_pass(self) -> None:
+        """措辞检验没跑成（输出不是合法 JSON）→ 缺席，不是通过：没被检验过的题不发布。"""
+        client = self._client('{"answer": "㐑"}', "我不知道")
+        result = roundtrip_answer(client, self._spec(), self._verbalized())
+        self.assertTrue(result.absent)
+        self.assertFalse(result.ok)
+
+    def test_writing_scan_is_skipped_when_the_reader_already_vetoed(self) -> None:
+        """其余判据已否决时不再发第二次请求——那条马上要重新措辞，省一次配额。"""
+        client = self._client('{"is_question": false, "answer": "㐑"}')
+        result = roundtrip_answer(client, self._spec(), self._verbalized())
+        self.assertFalse(result.ok)
+        self.assertEqual(client.calls, 1)
+
+    def test_writing_scan_payload_has_no_answer(self) -> None:
+        """措辞检验的载荷只有题干与解析，没有答案——给了答案它就会拿答案当尺子。"""
+        messages = build_writing_messages(self._verbalized())
+        self.assertEqual(set(json.loads(messages[1]["content"])), {"stem", "explanation"})
+
     def test_statement_instead_of_a_question_is_vetoed(self) -> None:
         """题干只是陈述（读者没有要回答的东西）→ 否决。"""
         result = roundtrip_answer(
@@ -698,16 +895,30 @@ class RoundTripTests(unittest.TestCase):
         self.assertFalse(result.absent)
 
     def test_missing_judgement_fields_are_not_a_veto(self) -> None:
-        """四个判据字段缺席时一律按「不否决」处理——「缺席不否决」是这一层的总规矩。
+        """三个**判据**字段缺席时按「不否决」处理——那是「读过了没意见」，不是「没读」。
 
-        预期：布尔字段缺席按 true、`writer_phrases` 缺席按空数组、`answer` 缺席按不比对；
-              老记录 / 模型漏字段都不该把一道好题判死。
+        预期：布尔字段缺席按 true、`writer_phrases` 缺席按空数组；老记录 / 模型漏字段都不该把
+              一道好题判死。唯一例外是 `answer`（见下一条）：读者没答就是没读成。
         """
-        result = roundtrip_answer(self._client('{"note": "模型只回了一句"}'), self._spec(), self._verbalized())
+        result = roundtrip_answer(
+            self._client('{"answer": "㐑", "note": "只给了答案没给判据字段"}'),
+            self._spec(), self._verbalized(),
+        )
         self.assertTrue(result.ok)
         self.assertTrue(result.is_question)
         self.assertTrue(result.identifies_subject)
         self.assertEqual(result.writer_phrases, ())
+
+    def test_a_note_without_an_answer_is_absent_not_a_pass(self) -> None:
+        """合法 JSON 但里面只有一句说明、没有答案 → **缺席**，不是通过。
+
+        预期：这条堵的是「字段级缺席被当成通过」——记录里不能写着「读者检验 ok」，
+              而读者其实一个字都没答。缺席由调用方重问；重问完仍缺席就不发布。
+        """
+        result = roundtrip_answer(self._client('{"note": "模型只回了一句"}'), self._spec(), self._verbalized())
+        self.assertFalse(result.ok)
+        self.assertTrue(result.absent)
+        self.assertIn("没有作答", result.error)
 
     def test_reader_answer_ok_separates_knowledge_from_missing_condition(self) -> None:
         """两种「答不出来」必须分开：知识题放行、缺条件否决。"""
@@ -744,9 +955,15 @@ class AnswerArbitrationTests(unittest.TestCase):
     def _spec(answer: str = "㐑"):
         return TaskSpec(task_id="T_test", instruction="i", facts={}, answer=answer)
 
-    @staticmethod
-    def _client(*texts: str):
+    # 措辞检验（读者那次之后、其余判据都过时才发的第二次请求）的回复：一句意见都没有。
+    # 它排在**最后**：这一类的调用顺序是「读题干 → 仲裁（要送才送）→ 措辞检验」，
+    # 所以把「没意见」追加在末尾，正好落在措辞检验那一次上。
+    _NO_WRITING_OPINION = '{"phrases": [], "note": ""}'
+
+    @classmethod
+    def _client(cls, *texts: str):
         """输入：按顺序吐出的正文。输出：假客户端。预期：记录调用次数，用尽后返回失败。"""
+        texts = (*texts, cls._NO_WRITING_OPINION)
 
         class _Client:
             def __init__(self) -> None:
@@ -778,7 +995,8 @@ class AnswerArbitrationTests(unittest.TestCase):
         result = roundtrip_answer(client, self._spec(), self._verbalized(), answer_judge=client)
         self.assertTrue(result.ok)
         self.assertEqual(result.answer_checked, "规则：快速通道")
-        self.assertEqual(client.calls, 1)
+        # 两次请求：读题干 + 措辞检验（后者只在其余判据都过时才发）。仲裁一次都没被叫。
+        self.assertEqual(client.calls, 2)
 
     def test_equivalent_rewrite_is_accepted_by_the_arbiter(self) -> None:
         """读者答的是题干里的料（同一个读音的另一种写法）→ 仲裁判等价 → 放行，并留下仲裁痕迹。
@@ -792,7 +1010,8 @@ class AnswerArbitrationTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertIn("LLM 仲裁", result.answer_checked)
-        self.assertEqual(client.calls, 2)
+        # 三次请求：读题干 + 仲裁 + 措辞检验。
+        self.assertEqual(client.calls, 3)
 
     def test_machine_value_needs_a_comparable_reading_from_the_arbiter(self) -> None:
         """机器值也送仲裁，但仲裁必须**解析出可比对的写法**——给不出来按缺席处理，退回快速通道。
@@ -836,7 +1055,8 @@ class AnswerArbitrationTests(unittest.TestCase):
         汉字题一大类是知识题（几画 / 读音 / 码位 / 第几页），2B 读者没有那些知识，编一个值
         出来是常态（实测 T14「码位是多少」被编出 `E1A0`）；否决它等于把好题丢掉。
         """
-        client = self._client('{"answer": "E1A0"}')
+        # 第二个正文是仲裁的回复（不是 JSON = 仲裁缺席），第三个才是措辞检验的「没意见」。
+        client = self._client('{"answer": "E1A0"}', "我不知道")
         result = roundtrip_answer(
             client, self._spec("U+3408"), self._verbalized("请问「㐈」的 Unicode 码位是多少？"),
             answer_judge=client,
@@ -867,7 +1087,8 @@ class AnswerArbitrationTests(unittest.TestCase):
         client = self._client('{"answer": "知识题"}')
         result = roundtrip_answer(client, self._spec(), self._verbalized(), answer_judge=client)
         self.assertTrue(result.ok)
-        self.assertEqual(client.calls, 1)
+        # 两次请求：读题干 + 措辞检验。读者的分类不送仲裁，所以没有第三次。
+        self.assertEqual(client.calls, 2)
 
     def test_without_arbiter_the_rule_still_vetoes(self) -> None:
         """没给仲裁客户端：只有快速通道——读者照着题干里的料答错就否决（题干把读者带偏了）。"""
@@ -889,11 +1110,28 @@ class ExplanationStatesAnswerTests(unittest.TestCase):
     def _spec():
         return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="xié")
 
-    @staticmethod
-    def _client(text: str):
+    # 措辞检验（第二次请求）的默认回复：一句意见都没有。绝大多数用例只关心第一次读题的判定，
+    # 所以默认给「没意见」，让 `_client(text)` 保持单参数的老用法。
+    _NO_WRITING_OPINION = '{"phrases": [], "note": ""}'
+
+    @classmethod
+    def _client(cls, text: str, writing: str | None = None):
+        """输入：第一次（读题干）的回复 + 可选的第二次（措辞检验）回复。输出：鸭子类型客户端。
+
+        预期：两次调用各吐各的；不给第二次时默认「没意见」。`calls` 记下真正发了几次请求——
+        「其余判据已否决就不再发第二次」这条省配额的规矩靠它来钉。
+        """
+        replies = [text, cls._NO_WRITING_OPINION if writing is None else writing]
+
         class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def complete(self, messages, *, temperature: float = 0.6, extra=None):
-                return Completion(ok=True, text=text, provider="p", model="m")
+                self.calls += 1
+                reply = replies[self.calls - 1] if self.calls <= len(replies) else replies[-1]
+                return Completion(ok=True, text=reply, provider="p", model="m")
+
         return _Client()
 
     @staticmethod
@@ -953,11 +1191,28 @@ class SubjectCorroborationTests(unittest.TestCase):
     def _spec():
         return TaskSpec(task_id="T_test", instruction="i", facts={}, answer="㐑")
 
-    @staticmethod
-    def _client(text: str):
+    # 措辞检验（第二次请求）的默认回复：一句意见都没有。绝大多数用例只关心第一次读题的判定，
+    # 所以默认给「没意见」，让 `_client(text)` 保持单参数的老用法。
+    _NO_WRITING_OPINION = '{"phrases": [], "note": ""}'
+
+    @classmethod
+    def _client(cls, text: str, writing: str | None = None):
+        """输入：第一次（读题干）的回复 + 可选的第二次（措辞检验）回复。输出：鸭子类型客户端。
+
+        预期：两次调用各吐各的；不给第二次时默认「没意见」。`calls` 记下真正发了几次请求——
+        「其余判据已否决就不再发第二次」这条省配额的规矩靠它来钉。
+        """
+        replies = [text, cls._NO_WRITING_OPINION if writing is None else writing]
+
         class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def complete(self, messages, *, temperature: float = 0.6, extra=None):
-                return Completion(ok=True, text=text, provider="p", model="m")
+                self.calls += 1
+                reply = replies[self.calls - 1] if self.calls <= len(replies) else replies[-1]
+                return Completion(ok=True, text=reply, provider="p", model="m")
+
         return _Client()
 
     @staticmethod
