@@ -7,7 +7,17 @@ name = "hanzi-synth"
 version = "0.1.0"
 description = "汉字结构化数据的合成管线：L0 事实底座 → L2 题目构造 → L3 措辞 → L4 验证"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "1cyberlangke1" }]
 dependencies = ["requests>=2.31", "json_repair>=0.63"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Private :: Do Not Upload",
+]
+
+[project.urls]
+Repository = "https://github.com/1cyberlangke1/hanzi-data-pipeline"
 
 [tool.setuptools.packages.find]
 where = ["src"]
