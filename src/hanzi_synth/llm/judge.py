@@ -1,6 +1,6 @@
-"""L4.5 LLM 裁判：**只在 L4 的程序防线全过后**才出场。
+"""L4.5 LLM 裁判：**只在 L4 的程序校验规则全过后**才出场。
 
-契约（synthesis/README.md §8.2）：
+契约：
 - 裁判是**最后一道**：前六道能过的题里，它只判「是否自足、是否有歧义、解析是否说清」；
 - 只判**二元**（过 / 不过）+ 一句理由，不用 1–10 分；
 - 裁判看到的只有**读者能看到的东西**（题干 / 解析 / 选项 / 答案），看不到 instruction /
@@ -33,7 +33,7 @@ def _criteria_block() -> str:
     return "\n".join(f"{i}. {text}" for i, (_name, text) in enumerate(JUDGE_CRITERIA, start=1))
 
 
-# **中文**：合成的是中文数据，判据与理由一律中文——英文要多一道翻译，2B 会译错，
+# **中文**：合成的是中文数据，判据与理由一律中文——英文要多一道翻译，小模型会译错，
 # 译错的词还会跟着理由一起回灌给措辞模型。
 JUDGE_SYSTEM_PROMPT = f"""你是这道题的一个读者。你手上只有这道题本身。
 
@@ -69,7 +69,7 @@ class Judgement:
     def as_dict(self) -> dict:
         """输入：无。输出：可 JSON 序列化的字典。预期：只留判定本身与**判定它的模型**，不留凭据。
         留 provider / model 是为了事后标定：同一批数据换了裁判模型，κ 是另一个数，
-        不记下来就分不清「裁判改了口径」还是「数据真的变好了」。
+        不记下来就分不清「裁判改了标准」还是「数据真的变好了」。
         """
         return {
             "ok": self.ok, "reason": self.reason, "error": self.error,
@@ -78,7 +78,7 @@ class Judgement:
 
 
 def judge_payload(spec: TaskSpec, verbalized: Any) -> dict:
-    """输入：TaskSpec + L3 产出。输出：给裁判的载荷。
+    """输入：TaskSpec + L3 产出。输出：给裁判的提示内容。
     预期：只放**读者能看到的东西**——题干、解析、选项、答案。绝不放 instruction /
           facts / proof。
     """
@@ -92,7 +92,7 @@ def judge_payload(spec: TaskSpec, verbalized: Any) -> dict:
 
 def build_judge_messages(spec: TaskSpec, verbalized: Any) -> list[dict]:
     """输入：TaskSpec + L3 产出。输出：OpenAI 格式 messages。
-    预期：与载荷同源——裁判看到的内容与真实读者一致，不多一个内部字段。
+    预期：与提示内容同源——裁判看到的内容与真实读者一致，不多一个内部字段。
     """
     return [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},

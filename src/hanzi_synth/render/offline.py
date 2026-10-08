@@ -2,7 +2,7 @@
 
 输入：TaskSpec（构造器已经算好的事实与答案）+ 一个 variant 序号。
 输出：(stem, explanation)。确定性：同一条 spec、同一个 variant，永远渲染出同一句话。
-预期：模板由程序自己写，措辞正确性由模板本身保证——这里不设闸门。唯一由数据决定、
+预期：模板由程序自己写，措辞正确性由模板本身保证——这里不设校验。唯一由数据决定、
       写模板时看不出来的约束是「非选择题的答案不许出现在题干里」，所以 `render` 对
       会泄题的变体返回 None，由调用方换下一个句式。
 
@@ -16,7 +16,7 @@
 自动退回裸写（见 `_quote`）。
 
 释义类题（T13 靠释义认字 / T17 问字义）**不在这里**：它们的题干或答案必须带上字典释义原文，
-而 AGENTS.md §六 规定释义类题必须走 LLM 路径（释义原文只进提示词、不进产出）。离线模板拿不到
+而释义类题必须走 LLM 路径（释义原文只进提示词、不进产出）。离线模板拿不到
 释义，实测渲染出来的是「读作 yī、yǐn 的字，请写出它的结构拆解」——同音字有一大堆，读者无从
 确定问的是哪一个；T17 的解析则是把字典原文当答案抄了出去（「㐇」的释义是「古文書所見奴婢名也」）。
 所以这两型的骨架与解析一并从这里删掉，不留死代码；名单见 `LLM_ONLY_TASK_IDS`。
@@ -755,7 +755,7 @@ class _Context(dict):
     """输入：`_context` 产出的占位符表。输出：给 `str.format_map` 用的映射。
     预期：模板**实际用到**的占位符若为空串，抛 `_EmptyPlaceholder` 让 `render` 判 None——
           没被用到的空值不影响（`_OPTIONAL_PLACEHOLDERS` 里的补充说明一律允许为空）。
-          这样「句子缺主语」这种垃圾在渲染这一步就被拦下，不会走到闸门后面去。
+          这样「句子缺主语」这种垃圾在渲染这一步就被拦下，不会走到校验后面去。
     """
 
     def __getitem__(self, key: str) -> str:
@@ -767,7 +767,7 @@ class _Context(dict):
 
 def _context(spec: TaskSpec, quote: tuple[str, str], sep: str) -> _Context:
     """输入：TaskSpec + 引号写法 + 候选分隔符。输出：句式填充用的上下文。
-    预期：每个占位符都有值，且**全部来自 spec**；某个骨架槽位取到空串时，`_Context` 会在
+    预期：每个占位符都有值，且**全部来自 spec**；某个骨架位置取到空串时，`_Context` 会在
           模板真正用到它的那一刻抛 `_EmptyPlaceholder`，`render` 据此判 None。
     """
     facts: Mapping[str, Any] = spec.facts or {}
@@ -829,7 +829,7 @@ def _stem_count(task_id: str, has_options: bool) -> int:
     """输入：题型 ID + 这题有没有候选。输出：**题干**的组合空间大小（不含解析写法）。
     预期：骨架 × 引号 × 候选呈现 × 候选分隔 × 开场 × 收尾；没有候选的题不乘候选那两段
           （它们根本不参与渲染，乘进去会把空间报大）。`stem_space` 与 `axes` 共用这一份算式——
-          各写一遍的话「统计口径」与「渲染口径」迟早会漂（旧报告里 `space=2400` 却写着
+          各写一遍的话「统计标准」与「渲染标准」迟早会漂（旧报告里 `space=2400` 却写着
           「不同解析 16」，正是两边各算各的留下的）。
     """
     cores = len(_CORES.get(task_id, ()))
@@ -951,11 +951,11 @@ def render(spec: TaskSpec, variant: int) -> tuple[str, str] | None:
         if tail:
             parts.append(tail)
         stem = "".join(parts)
-        # 答案在题干里出现几次算泄题：**与闸门 `no_answer_leak` 共用同一判据**
+        # 答案在题干里出现几次算泄题：**与校验 `no_answer_leak` 共用同一判据**
         # （`verify.checks.answer_leak_limit`），只是这里用来换句式而不是判废。T9 的答案常是
         # 「上」「一」这类字，题干里的方位词、语气词本来就可能带上它们；选择题的答案又必然
         # 出现在候选名单里，撞上模板用词（「从…里挑一个」撞答案「从」）时次数就超了。
-        # 渲染完再被闸门拒，这条 (题型, 字) 就一条数据都出不来——实测 38 条被拒的记录里
+        # 渲染完再被校验拒，这条 (题型, 字) 就一条数据都出不来——实测 38 条被拒的记录里
         # 32 条本来只要换一条不撞答案的句式就能出（`synthesis/out/probe_leak_rescue.py`）。
         stem_norm = normalize_for_match(stem)
         if any(

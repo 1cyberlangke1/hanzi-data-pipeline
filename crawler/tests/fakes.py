@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable
 
 
 class FakeResponse:
-    """输入：状态码、JSON 载荷、原始字节、是否模拟「不是 JSON」。输出：可被 client 消费的响应对象。"""
+    """输入：状态码、JSON 提示内容、原始字节、是否模拟「不是 JSON」。输出：可被 client 消费的响应对象。"""
 
     def __init__(
         self,
@@ -25,7 +25,7 @@ class FakeResponse:
         self.content = content
 
     def json(self) -> Any:
-        """输入：无。输出：预置载荷；invalid_json 为真时抛 ValueError（模拟 HTML 错误页）。"""
+        """输入：无。输出：预置提示内容；invalid_json 为真时抛 ValueError（模拟 HTML 错误页）。"""
         if self._invalid_json:
             raise ValueError("Expecting value: line 1 column 1 (char 0)")
         return self._payload

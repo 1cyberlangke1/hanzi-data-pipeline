@@ -5,7 +5,7 @@
 - **产出必须自足、假设字典一定对** —— 污染检测查的是「题干有没有把外部语料大段抄进去」，
   而不是去质疑字典。
 
-本模块**只读产出、只写旁路文件**：原产出文件一个字节都不改。
+本模块**只读产出、只写附带文件**：原产出文件一个字节都不改。
 """
 
 from __future__ import annotations
@@ -147,7 +147,7 @@ class DedupIndex:
 def load_jsonl(path: Path) -> tuple[list[dict], int]:
     """输入：jsonl 路径。输出：(解析成功的记录列表, 跳过的坏行数)。
     预期：空行与坏 JSON 都跳过并计数——报告要如实说明「有多少行没能参与」；
-          文件不存在返回 ([], 0)，不抛异常（旁路工具不该因为缺文件崩掉）。
+          文件不存在返回 ([], 0)，不抛异常（附带工具不该因为缺文件崩掉）。
     """
     rows: list[dict] = []
     skipped = 0
@@ -362,7 +362,7 @@ def contamination_file(
 
 
 def write_report(out_path: Path, report: Mapping[str, Any], *, suffix: str = ".dedup.json") -> Path:
-    """输入：产出路径 + 报告 + 旁路后缀。输出：旁路报告路径。
+    """输入：产出路径 + 报告 + 附带后缀。输出：附带报告路径。
     预期：写 `<out><suffix>`（默认 `<out>.dedup.json`），原产出一个字节不动。
     """
     target = out_path.with_name(out_path.name + suffix)

@@ -51,7 +51,7 @@ class ScriptedClient:
 def compliant_body(payload: dict) -> str:
     """输入：L3 的 payload。输出：一份能过 L4 的规范正文。
     预期：题干直接用 `instruction`——它就是这道题要问的那句话，也天然带上主语与「问什么」的说法
-          （假客户端要像真模型一样看这份载荷，否则它造出的「规范」正文其实是残废题）；
+          （假客户端要像真模型一样看这份提示内容，否则它造出的「规范」正文其实是残废题）；
           候选只在**说明里没写全**时补一次——说明现在就把候选写在句首，再补一遍就是同一个字
           出现两次，`no_answer_leak` 判的正是「答案出现几次」，补第二遍等于自己造泄题；
           解析里说出答案。
@@ -60,7 +60,7 @@ def compliant_body(payload: dict) -> str:
     answer = payload["answer"]
     # 假客户端要像真模型一样**改写**说明，不能原样回显：原样回显正是 `no_instruction_copy`
     # 拦下的那种产出（真机实测 23/1,321 条；离线模板池 0 条）。加一句问法前缀即可，
-    # 主语与「问什么」都还在，别的闸门照样过。
+    # 主语与「问什么」都还在，别的校验照样过。
     stem = f"请问{payload.get('instruction') or '这个字是什么'}？"
     options = [option for option in (payload.get("options") or []) if option]
     if options and not all(option in stem for option in options):
@@ -192,7 +192,7 @@ class PipelineOfflineTests(unittest.TestCase):
             self.assertTrue(all("answer" in row for row in rows))
 
     def test_offline_records_are_replay_ready(self) -> None:
-        """dry-run 记录带上回炉所需的 proof / visible_subject / difficulty，否则回炉无从重建。"""
+        """dry-run 记录带上重跑所需的 proof / visible_subject / difficulty，否则重跑无从重建。"""
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "chars.jsonl"
             out = Path(tmp) / "out.jsonl"
@@ -204,17 +204,17 @@ class PipelineOfflineTests(unittest.TestCase):
                 self.assertIn("proof", row)
                 self.assertIn("visible_subject", row)
                 self.assertIn("must_contain", row)
-                # 闸门判据（题干必须问什么、解析里只许出现哪些结构词）也要落盘，
-                # 否则回炉路径比实时路径松（replay 会把实时拦下的泄题放出去）
+                # 校验判据（题干必须问什么、解析里只许出现哪些结构词）也要写入文件，
+                # 否则重跑路径比实时路径松（replay 会把实时拦下的泄题放出去）
                 self.assertIn("stem_asks_any", row)
                 self.assertIn("structure_words", row)
-                # 请求模型时只发这几个事实键；它不落盘，回炉就会退回「整份 facts 全发」——
-                # 实测把 `source`（康熙字典）又发了出去，回炉那条写成「根据《康熙字典》记载」。
+                # 请求模型时只发这几个事实键；它不写入文件，重跑就会退回「整份 facts 全发」——
+                # 实测把 `source`（康熙字典）又发了出去，重跑那条写成「根据《康熙字典》记载」。
                 self.assertIn("payload_facts", row)
                 self.assertEqual(row["difficulty"]["kind"], "analytic-prior")
 
     def test_offline_record_round_trips_gate_criteria(self) -> None:
-        """`spec_from_record` 必须把两条闸门判据原样读回来（互逆是回炉路径的正确性前提）。"""
+        """`spec_from_record` 必须把两条校验判据原样读回来（互逆是重跑路径的正确性前提）。"""
         spec = TaskSpec(
             task_id="T13_ids_reverse", instruction="i", facts={}, answer="⿸𠂆⿱𫜹𠃌",
             stem_asks_any=("IDS", "拆解"), structure_words=("左上包围", "上下"),
@@ -403,7 +403,7 @@ class PipelineLiveTests(unittest.TestCase):
 
 
 class PipelineDurabilityTests(unittest.TestCase):
-    """数据不丢：续跑追加、半行修复、覆盖前备份、拒绝写到输入上、独占锁、覆盖率旁路。"""
+    """数据不丢：续跑追加、半行修复、覆盖前备份、拒绝写到输入上、独占锁、覆盖率附带。"""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -473,7 +473,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertFalse(lock.exists())
 
     def test_coverage_sidecar_reports_progress(self) -> None:
-        """覆盖率旁路文件：报池子大小、已覆盖、剩余，以及本轮实测速度。"""
+        """覆盖率附带文件：报字库大小、已覆盖、剩余，以及本轮实测速度。"""
         out = self.dir / "cov.jsonl"
         stats = run_pipeline(PipelineConfig(limit=4, out_path=out, data_path=self.data), client=PayloadEchoClient())
         self.assertEqual(stats["coverage"]["pool"], 4)
@@ -485,7 +485,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertIn("eta_hours_with_workers", sidecar)
 
     def test_coverage_sidecar_counts_whole_file_not_just_this_run(self) -> None:
-        """旁路报告的 by_task / records 是累计进度，本轮增量单独放 this_run，两者不混。"""
+        """附带报告的 by_task / records 是累计进度，本轮增量单独放 this_run，两者不混。"""
         out = self.dir / "cum.jsonl"
         run_pipeline(PipelineConfig(limit=4, out_path=out, data_path=self.data), client=PayloadEchoClient())
         first = json.loads((self.dir / "cum.jsonl.coverage.json").read_text(encoding="utf-8"))
@@ -507,7 +507,7 @@ class PipelineDurabilityTests(unittest.TestCase):
             self.assertGreater(row["difficulty"]["target_facility"], 0.0)
 
     def test_rejects_carry_replay_payload(self) -> None:
-        """rejects 里必须存完整 spec 载荷，否则回炉时无从重建题目。"""
+        """rejects 里必须存完整 spec 提示内容，否则重跑时无从重建题目。"""
         out = self.dir / "rej.jsonl"
         run_pipeline(
             PipelineConfig(limit=1, out_path=out, data_path=self.data, retries=0), client=FlakyClient(bad_rounds=1)
@@ -522,7 +522,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertTrue(payload["answer"])
         self.assertIn("facts", payload)
         self.assertIn("difficulty", payload)
-        # 闸门判据也要落盘：丢了它们，回炉路径会比实时路径松（有单测盯着这条）
+        # 校验判据也要写入文件：丢了它们，重跑路径会比实时路径松（有单测盯着这条）
         self.assertIn("stem_asks_any", payload)
         self.assertIn("structure_words", payload)
         self.assertIn("hidden_subject", payload)
@@ -546,7 +546,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertTrue(rows[0]["stem"])
 
     def test_replay_is_idempotent(self) -> None:
-        """回炉可重复跑：已进主产出的 (题型, 字) 直接跳过，不重复花配额。"""
+        """重跑可重复跑：已进主产出的 (题型, 字) 直接跳过，不重复花配额。"""
         out = self.dir / "idem.jsonl"
         run_pipeline(
             PipelineConfig(limit=1, out_path=out, data_path=self.data, retries=0), client=FlakyClient(bad_rounds=1)
@@ -560,7 +560,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertEqual(second["recovered"], 0)
 
     def test_replay_reports_unreplayable_rows(self) -> None:
-        """老格式 rejects（没有 spec 载荷）如实计入 unreplayable，并另存新文件，原文件不动。"""
+        """老格式 rejects（没有 spec 提示内容）如实计入 unreplayable，并另存新文件，原文件不动。"""
         out = self.dir / "old.jsonl"
         rejects = self.dir / "old.rejects.jsonl"
         rejects.write_text(
@@ -578,7 +578,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertEqual(rejects.read_text(encoding="utf-8"), before)
 
     def test_replay_of_replayed_file_does_not_nest(self) -> None:
-        """拿回炉产物再回炉：产出仍写回同一个 <x>.replayed.jsonl，不生成更深一层。"""
+        """拿重跑产物再重跑：产出仍写回同一个 <x>.replayed.jsonl，不生成更深一层。"""
         out = self.dir / "nest.jsonl"
         run_pipeline(
             PipelineConfig(limit=1, out_path=out, data_path=self.data, retries=0), client=FlakyClient(bad_rounds=1)
@@ -601,7 +601,7 @@ class PipelineDurabilityTests(unittest.TestCase):
         self.assertEqual(_replay_left_path(deep), self.dir / "x.rejects.jsonl.replayed.jsonl")
 
     def test_replay_refuses_offline(self) -> None:
-        """回炉必须联网措辞：offline 直接报错，不静默空跑。"""
+        """重跑必须联网措辞：offline 直接报错，不静默空跑。"""
         with self.assertRaises(ConfigError):
             replay_rejects(
                 PipelineConfig(offline=True, out_path=self.dir / "x.jsonl", data_path=self.data),
@@ -611,7 +611,7 @@ class PipelineDurabilityTests(unittest.TestCase):
 
 
 class _FakeReplay:
-    """输入：每一轮要返回的统计。输出：鸭子类型的回炉函数。
+    """输入：每一轮要返回的统计。输出：鸭子类型的重跑函数。
     预期：记下每一轮收到的路径（断言「下一轮吃的是上一轮的残留文件」），脚本用尽还被打
           就报错——那正是「一轮没救回还继续喂」的空转。
     """
@@ -623,13 +623,13 @@ class _FakeReplay:
     def __call__(self, path: Path) -> dict:
         self.paths.append(Path(path))
         if not self._script:
-            raise AssertionError("自动回炉多跑了一轮：脚本里没有这一轮的预设")
+            raise AssertionError("自动重跑多跑了一轮：脚本里没有这一轮的预设")
         return self._script.pop(0)
 
 
 def _round_stats(planned: int, recovered: int, left: str = "x.rejects.jsonl.replayed.jsonl",
                  still_failed: int = 0) -> dict:
-    """输入：一轮的关键计数。输出：回炉统计 dict。预期：字段名与 `replay_rejects` 一致。"""
+    """输入：一轮的关键计数。输出：重跑统计 dict。预期：字段名与 `replay_rejects` 一致。"""
     return {
         "planned": planned,
         "recovered": recovered,
@@ -641,14 +641,14 @@ def _round_stats(planned: int, recovered: int, left: str = "x.rejects.jsonl.repl
 
 
 class AutoReplayTests(unittest.TestCase):
-    """输入：假的单轮回炉函数。输出：断言。预期：收敛判据只有「这一轮有没有新救回」——
+    """输入：假的单轮重跑函数。输出：断言。预期：收敛判据只有「这一轮有没有新救回」——
     一条都没救回就立刻停（同一批输入 + 同一温度 + 没有状态变化，再喂只会复现同一批失败）。"""
 
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
         self.rejects = self.dir / "x.rejects.jsonl"
         self.rejects.write_text("{}\n", encoding="utf-8")
-        # 残留文件：`auto_replay` 只吃真实存在的文件，假回炉也得把它写出来。
+        # 残留文件：`auto_replay` 只吃真实存在的文件，假重跑也得把它写出来。
         self.leftover = self.dir / "x.rejects.jsonl.replayed.jsonl"
         self.leftover.write_text("{}\n", encoding="utf-8")
 
@@ -670,12 +670,12 @@ class AutoReplayTests(unittest.TestCase):
         self.assertEqual(replay.paths, [self.rejects, self.leftover])
 
     def test_stops_when_there_is_nothing_to_replay(self) -> None:
-        """残留文件里全是老格式（无 spec 载荷）时 planned=0，一轮就停。"""
+        """残留文件里全是老格式（无 spec 提示内容）时 planned=0，一轮就停。"""
         replay = _FakeReplay([_round_stats(planned=0, recovered=0)])
         self.assertEqual(len(auto_replay(replay, self.rejects, max_rounds=5)), 1)
 
     def test_respects_max_rounds(self) -> None:
-        """一直有救回时最多跑 max_rounds 轮，不会无限回炉。"""
+        """一直有救回时最多跑 max_rounds 轮，不会无限重跑。"""
         replay = _FakeReplay(
             [_round_stats(planned=9, recovered=1, left=str(self.leftover)) for _ in range(5)]
         )
@@ -697,7 +697,7 @@ class AutoReplayTests(unittest.TestCase):
         self.assertEqual(rounds[0]["planned"], 1)
 
     def test_say_reports_every_stop_reason(self) -> None:
-        """进度回调必须说清「为什么停」：零救回与无可回炉是两种不同的收尾原因。"""
+        """进度回调必须说清「为什么停」：零救回与无可重跑是两种不同的收尾原因。"""
         lines: list[str] = []
         replay = _FakeReplay([_round_stats(planned=2, recovered=0, still_failed=2)])
         auto_replay(replay, self.rejects, max_rounds=3, say=lines.append)
@@ -706,7 +706,7 @@ class AutoReplayTests(unittest.TestCase):
 
 class AttemptSummaryTests(unittest.TestCase):
     """输入：手写的 attempts 文件。输出：断言。预期：首轮通过 / 被救回 / 仍失败三类分清，
-    并指出首轮是哪条防线、哪种语体把题拦下来的。
+    并指出首轮是哪条校验规则、哪种语体把题拦下来的。
     """
 
     def setUp(self) -> None:
@@ -741,7 +741,7 @@ class AttemptSummaryTests(unittest.TestCase):
         self.assertEqual(report["by_first_defense"], {"options_ok": 2})
 
     def test_judge_veto_is_not_counted_as_first_pass(self) -> None:
-        """裁判否决那轮的 tier 是 A（程序防线的结论）却没发布：attempt-stats 必须记成首轮没过，
+        """裁判否决那轮的 tier 是 A（程序校验规则的结论）却没发布：attempt-stats 必须记成首轮没过，
         并把「裁判否决」记进 by_first_defense；裁判**缺席**（没跑成）同样不算通过，
         记进「裁判缺席」桶——没被检验过的题不能算过。
         """
@@ -799,7 +799,7 @@ class AttemptLogTests(unittest.TestCase):
 
 
 class JudgeWiringTests(unittest.TestCase):
-    """输入：假措辞客户端 + 脚本化裁判客户端。输出：断言。预期：裁判**只在程序防线全过后**出场；
+    """输入：假措辞客户端 + 脚本化裁判客户端。输出：断言。预期：裁判**只在程序校验规则全过后**出场；
     裁判否决的题进 rejects 并留下理由；裁判缺席（跑挂了）先重问、重问完仍缺席就不发布；
     批量模式与裁判互斥。
     """
@@ -821,7 +821,7 @@ class JudgeWiringTests(unittest.TestCase):
         )
 
     def test_judge_reject_sends_record_to_rejects_with_reason(self) -> None:
-        """裁判否决 = 不进产出，改走 rejects，且理由必须落盘。"""
+        """裁判否决 = 不进产出，改走 rejects，且理由必须写入文件。"""
         out, stats = self._run("rej.jsonl", ScriptedClient(['{"ok": false, "reason": "题干里写着写作要求"}']))
         self.assertEqual(stats["ok"], 0)
         self.assertEqual(stats["rejected"], 1)
@@ -834,7 +834,7 @@ class JudgeWiringTests(unittest.TestCase):
         self.assertEqual(rows[0]["judge"]["reason"], "题干里写着写作要求")
 
     def test_judge_pass_publishes_and_records_verdict(self) -> None:
-        """裁判放行 = 进产出，且判定如实落盘（事后要靠它标定裁判）。"""
+        """裁判放行 = 进产出，且判定如实写入文件（事后要靠它标定裁判）。"""
         out, stats = self._run("pass.jsonl", ScriptedClient(['{"ok": true, "reason": "无"}']))
         self.assertEqual(stats["ok"], 1)
         rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
@@ -850,7 +850,7 @@ class JudgeWiringTests(unittest.TestCase):
         self.assertTrue(rows[0]["judge"]["ok"])
 
     def test_absent_judge_keeps_the_record_out_of_the_output(self) -> None:
-        """重问完仍缺席 = 这条题没被检验过 → 不发布，进 rejects（可回炉，题不丢）。"""
+        """重问完仍缺席 = 这条题没被检验过 → 不发布，进 rejects（可重跑，题不丢）。"""
         out, stats = self._run("absent.jsonl", ScriptedClient(["这不是 JSON"]))
         self.assertEqual(stats["ok"], 0)
         self.assertEqual(stats["rejected"], 1)
@@ -861,7 +861,7 @@ class JudgeWiringTests(unittest.TestCase):
         self.assertTrue(any("裁判缺席" in failure for failure in rows[0]["failures"]), rows[0]["failures"])
 
     def test_judge_is_never_called_when_rules_fail(self) -> None:
-        """程序防线没过时一次都不该叫裁判——规则优先，裁判是最后一道。"""
+        """程序校验规则没过时一次都不该叫裁判——规则优先，裁判是最后一道。"""
         judge = ScriptedClient([])
         out = self.dir / "never.jsonl"
         run_pipeline(
@@ -903,7 +903,7 @@ class JudgeWiringTests(unittest.TestCase):
 
     def test_veto_reason_reaches_next_round_with_fix_hint(self) -> None:
         """裁判否决的理由必须回灌给下一轮：不告诉模型错在哪，它会在同一处再摔。
-        首轮程序防线没过 -> 不叫裁判；次轮程序过了被裁判否决 -> 第三轮必须带着理由重写。
+        首轮程序校验规则没过 -> 不叫裁判；次轮程序过了被裁判否决 -> 第三轮必须带着理由重写。
         """
         from hanzi_synth.verify.checks import JUDGE_FEEDBACK_KEY
 
@@ -922,7 +922,7 @@ class JudgeWiringTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 3)
         last = json.dumps(client.requests[-1], ensure_ascii=False)
         self.assertIn("题干有歧义", last)
-        # 闸门名是给 rejects 看的行话，不进模型上下文——模型只需要「哪里不对」。
+        # 校验名是给 rejects 看的行话，不进模型上下文——模型只需要「哪里不对」。
         self.assertNotIn(JUDGE_FEEDBACK_KEY, last)
 
     def test_batch_and_judge_are_mutually_exclusive(self) -> None:
@@ -940,7 +940,7 @@ class BetterRoundTests(unittest.TestCase):
     """输入：逐轮判定记录。输出：选中的那一轮。
 
     预期：重试用尽时返回**最好的一轮**，不是最后一轮——实测第二轮退化（T10 整段输出散文、
-    T5_variant 把载荷原样回显）会把第一轮的合格产出顶掉，rejects 里记的也变成第二轮的原因。
+    T5_variant 把提示内容原样回显）会把第一轮的合格产出顶掉，rejects 里记的也变成第二轮的原因。
     """
 
     def test_prefers_tier_a_over_tier_c(self) -> None:
@@ -948,7 +948,7 @@ class BetterRoundTests(unittest.TestCase):
 
         history = [
             {"tier": "A", "failures": [], "judge": None, "roundtrip": None},
-            {"tier": "C", "failures": ["schema: 缺少 stem 槽位"], "judge": None, "roundtrip": None},
+            {"tier": "C", "failures": ["schema: 缺少 stem 位置"], "judge": None, "roundtrip": None},
         ]
         self.assertEqual(_better_round(history, 1, 0), 0)
 
@@ -1075,7 +1075,7 @@ class AbsentCheckRetryTests(unittest.TestCase):
 
     预期：缺席（请求挂了 / 只吐思考段 / 输出不是 JSON）是**工具没干成活**，不是「这段文字不合格」——
           同一条题重问（`CHECK_ATTEMPTS` 次）：重问出判定就按判定走；重问完仍缺席**不发布**，
-          题进 rejects 回炉（题不丢，也不会带着「读者没读过的题」进数据集）。
+          题进 rejects 重跑（题不丢，也不会带着「读者没读过的题」进数据集）。
     """
 
     class _ReaderClient:
@@ -1091,12 +1091,12 @@ class AbsentCheckRetryTests(unittest.TestCase):
             payload = payload_of(messages)
             body = _last_json_object(messages)
             if "explanation" in body and "answer" not in body:
-                # 措辞检验（L4.7）的载荷：只有 stem / explanation，没有答案也没有候选。
-                # 夹具一律回「没意见」——本类测试钉的不是那条闸门。
+                # 措辞检验（L4.7）的提示内容：只有 stem / explanation，没有答案也没有候选。
+                # 夹具一律回「没意见」——本类测试钉的不是那条校验。
                 return Completion(
                     ok=True, text=json.dumps({"phrases": [], "note": ""}), provider="scripted", model="m"
                 )
-            if "answer" not in payload:  # 读者轮：载荷里只有题干与候选
+            if "answer" not in payload:  # 读者轮：提示内容里只有题干与候选
                 self.reader_calls += 1
                 if self.absent_at == 0 or self.reader_calls == self.absent_at:
                     return Completion(ok=False, text="", provider="scripted", model="m", error="boom")
@@ -1178,7 +1178,7 @@ class AbsentCheckRetryTests(unittest.TestCase):
 
 
 class RejectSummaryTests(unittest.TestCase):
-    """输入：手写的 rejects / replayed 文件。输出：断言。预期：汇总按防线名与题型计数，
+    """输入：手写的 rejects / replayed 文件。输出：断言。预期：汇总按校验规则名与题型计数，
     且**原文件一字不动**（rejects 是只增日志，汇总工具只能读）。
     """
 
@@ -1193,7 +1193,7 @@ class RejectSummaryTests(unittest.TestCase):
         )
 
     def test_counts_by_defense_and_task(self) -> None:
-        """同一防线在一行里出现两次要计两次；汇总后原文件字节不变。"""
+        """同一校验规则在一行里出现两次要计两次；汇总后原文件字节不变。"""
         from hanzi_synth.pipeline.run import summarize_rejects
 
         self._write(self.path, [
@@ -1211,7 +1211,7 @@ class RejectSummaryTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_reports_replayed_sibling_and_unreplayable(self) -> None:
-        """没有 spec 载荷的旧格式记 unreplayable；同级 .replayed.jsonl 一并汇总。"""
+        """没有 spec 提示内容的旧格式记 unreplayable；同级 .replayed.jsonl 一并汇总。"""
         from hanzi_synth.pipeline.run import summarize_rejects
 
         self._write(self.path, [{"task_id": "T4_reading", "failures": [], "spec": None}])
@@ -1232,10 +1232,10 @@ class RejectSummaryTests(unittest.TestCase):
             summarize_rejects(self.dir / "nope.rejects.jsonl")
 
 class StemGateRecoveryTests(unittest.TestCase):
-    """复验要按**当前**题型闸门判定：旧记录的 `stem_asks_any` 是空的（生产时还没这道闸门）。"""
+    """复验要按**当前**题型校验判定：旧记录的 `stem_asks_any` 是空的（生产时还没这道校验）。"""
 
     def test_spec_from_record_fills_the_gate_from_the_task_table(self) -> None:
-        """输入：一份 `stem_asks_any` 为空的旧载荷。输出：补上该题型当前声明的闸门。
+        """输入：一份 `stem_asks_any` 为空的旧提示内容。输出：补上该题型当前声明的校验。
         预期：不补的话 `stem_asks` 那一关整条跳过，「题干问读音、答案是笔画数」的废题会被判 A。
         """
         spec = spec_from_record(
@@ -1244,7 +1244,7 @@ class StemGateRecoveryTests(unittest.TestCase):
         self.assertEqual(spec.stem_asks_any, TASK_STEM_ASKS["T1_stroke_total"])
 
     def test_spec_from_record_keeps_a_recorded_gate(self) -> None:
-        """反例：载荷自己带了闸门就原样用，不被题型表覆盖。"""
+        """反例：提示内容自己带了校验就原样用，不被题型表覆盖。"""
         spec = spec_from_record(
             {
                 "task_id": "T1_stroke_total",
@@ -1257,7 +1257,7 @@ class StemGateRecoveryTests(unittest.TestCase):
         self.assertEqual(spec.stem_asks_any, ("\u81ea\u5b9a\u4e49",))
 
     def test_spec_from_record_unknown_task_gets_no_gate(self) -> None:
-        """未知题型（如已下线的 T17）补不出闸门，退回空元组——不猜。"""
+        """未知题型（如已下线的 T17）补不出校验，退回空元组——不猜。"""
         spec = spec_from_record(
             {"task_id": "T17_stroke_rank", "instruction": "i", "facts": {}, "answer": "x", "stem_asks_any": []}
         )
@@ -1346,12 +1346,12 @@ class PlanCompletenessTests(unittest.TestCase):
             ):
                 expected.append((spec.task_id, character.ziid))
         self.assertGreater(
-            len(expected), len({ziid for _task, ziid in expected}), "池子太小，测不出丢组合"
+            len(expected), len({ziid for _task, ziid in expected}), "字库太小，测不出丢组合"
         )
         self.assertEqual(Counter((spec.task_id, ch.ziid) for ch, spec in planned), Counter(expected))
 
     def test_small_limit_still_spreads_across_characters(self) -> None:
-        """小批量仍然要铺开字：`--limit` 小于池子时，第一轮就把字分散开，不重复用字。"""
+        """小批量仍然要铺开字：`--limit` 小于字库时，第一轮就把字分散开，不重复用字。"""
         config = PipelineConfig(
             limit=4, out_path=self.dir / "small.jsonl", data_path=self.data, offline=True,
             task_ids=("T1_stroke_total", "T3_ids_forward"), resume=False,
@@ -1414,7 +1414,7 @@ class LocalWorkerCapTests(unittest.TestCase):
 
 def _last_json_object(messages) -> dict:
     """输入：messages。输出：最后一条能解析成 JSON 对象的 user 消息（取不到返回空字典）。
-    预期：往返检验的载荷没有 `answer` 键，`payload_of` 按定义认不出来，所以这里按形状单独取。
+    预期：往返检验的提示内容没有 `answer` 键，`payload_of` 按定义认不出来，所以这里按形状单独取。
     """
     for message in reversed(list(messages)):
         if message.get("role") != "user":
@@ -1426,22 +1426,22 @@ def _last_json_object(messages) -> dict:
 
 
 def read_answer_from_stem(expected: str, body: dict) -> str:
-    """输入：这道题定死的答案 + 往返检验载荷。输出：一个称职读者会答出的内容。
+    """输入：这道题定死的答案 + 往返检验提示内容。输出：一个称职读者会答出的内容。
 
-    预期：**往返检验的载荷里没有解析**（有解析这道检验就自证了），所以假读者只能靠题干；
+    预期：**往返检验的提示内容里没有解析**（有解析这道检验就自证了），所以假读者只能靠题干；
           而 `compliant_body` 的题干是「「好」是什么？」这种最朴素的问法，题干本身推不出答案。
           本夹具因此直接给出标准答案，用来钉**接线**：答对就发布、答错就不发布。
-          它不负责证明「2B 读者能读懂」——那是真机探针的事。
+          它不负责证明「小模型读者能读懂」——那是真机探针的事。
     """
     return expected
 
 
 def read_wrong_answer_from_stem(expected: str, body: dict) -> str:
-    """输入：定死的答案 + 往返检验载荷。输出：一个**在题干里找得到出处**的错答案。
+    """输入：定死的答案 + 往返检验提示内容。输出：一个**在题干里找得到出处**的错答案。
 
     预期：钉住「题干把读者带偏了」那一半接线——读者照着题干里的料答错了（选了题干列出的
           另一个候选，或抄了题干里的值）。与「读者凭空猜一个值」分开：后者不否决，
-          见 `llm.roundtrip._traceable_to_stem`（汉字题一大类是知识题，2B 编值是常态）。
+          见 `llm.roundtrip._traceable_to_stem`（汉字题一大类是知识题，小模型编值是常态）。
     """
     options = [str(item) for item in (body.get("options") or []) if item and str(item) != expected]
     if options:
@@ -1453,7 +1453,7 @@ def read_wrong_answer_from_stem(expected: str, body: dict) -> str:
 
 
 def read_guessed_answer_from_stem(_expected: str, _body: dict) -> str:
-    """输入：定死的答案 + 载荷。输出：一个题干里根本没有的值（读者自己编的）。
+    """输入：定死的答案 + 提示内容。输出：一个题干里根本没有的值（读者自己编的）。
     预期：与 `read_wrong_answer_from_stem` 成对，用来钉「猜出来的值不否决」那一半接线。
     """
     return "E1A0"
@@ -1463,12 +1463,12 @@ class RoundTripGateTests(unittest.TestCase):
     """输入：往返检验答对 / 答错两种假客户端。输出：记录发不发布。预期：答错就不发布。"""
 
     class _ReaderClient:
-        """输入：读者函数 `(定死的答案, 往返载荷) -> 读者答出的文本`。输出：假客户端。
+        """输入：读者函数 `(定死的答案, 往返提示内容) -> 读者答出的文本`。输出：假客户端。
         预期：先答 L3（规范正文），再当读者答一次。
 
-        两步靠载荷形状区分：L3 载荷带 `answer` 键，往返检验载荷只有 stem / options。
-        往返载荷**没有** `payload_of` 认得的 `answer` 键，所以读者那一步直接解析最后一条 user 消息；
-        定死的答案由上一步的 L3 载荷带过来（读者手上没有它，夹具只是拿它替读者「答对」）。
+        两步靠提示内容形状区分：L3 提示内容带 `answer` 键，往返检验提示内容只有 stem / options。
+        往返提示内容**没有** `payload_of` 认得的 `answer` 键，所以读者那一步直接解析最后一条 user 消息；
+        定死的答案由上一步的 L3 提示内容带过来（读者手上没有它，夹具只是拿它替读者「答对」）。
         """
 
         def __init__(self, reader) -> None:
@@ -1481,12 +1481,12 @@ class RoundTripGateTests(unittest.TestCase):
             payload = payload_of(messages)
             body = _last_json_object(messages)
             if "explanation" in body and "answer" not in body:
-                # 措辞检验（L4.7）的载荷：只有 stem / explanation，没有答案也没有候选。
-                # 夹具一律回「没意见」——本类测试钉的不是那条闸门。
+                # 措辞检验（L4.7）的提示内容：只有 stem / explanation，没有答案也没有候选。
+                # 夹具一律回「没意见」——本类测试钉的不是那条校验。
                 return Completion(
                     ok=True, text=json.dumps({"phrases": [], "note": ""}), provider="scripted", model="m"
                 )
-            if "answer" not in payload:  # 往返检验的载荷：只有 stem / options
+            if "answer" not in payload:  # 往返检验的提示内容：只有 stem / options
                 return Completion(
                     ok=True,
                     text=json.dumps({"answer": self._reader(self.answer, body)}, ensure_ascii=False),
@@ -1496,9 +1496,9 @@ class RoundTripGateTests(unittest.TestCase):
             return Completion(ok=True, text=compliant_body(payload), provider="scripted", model="m")
 
     def setUp(self) -> None:
-        # 用与 `PipelineLiveTests` 同一份 4 字固定池子：`compliant_body` 只在那份池子上
+        # 用与 `PipelineLiveTests` 同一份 4 字固定字库：`compliant_body` 只在那份字库上
         # 保证能过 L4（默认全池里有带 `must_contain` 的题型，它满足不了）。测试要钉的是
-        # 往返闸门的接线，不是 `compliant_body` 的覆盖面。
+        # 往返校验的接线，不是 `compliant_body` 的覆盖面。
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
@@ -1526,7 +1526,7 @@ class RoundTripGateTests(unittest.TestCase):
         self.assertEqual(len(self._run(read_guessed_answer_from_stem, "guessed.jsonl")), 1)
 
     def test_correct_reader_answer_is_published(self) -> None:
-        """读者答出了定死的答案 → 照常发布。判据比对的是载荷里定死的答案，不是模型的偏好。"""
+        """读者答出了定死的答案 → 照常发布。判据比对的是提示内容里定死的答案，不是模型的偏好。"""
         self.assertEqual(len(self._run(read_answer_from_stem, "right.jsonl")), 1)
 
 
@@ -1536,14 +1536,14 @@ class AnswerArbitrationWiringTests(unittest.TestCase):
     预期：**答案仲裁不受 `--judge` 开关控制**——读者答出的是一句自然语言，与程序定死的答案
           对不上时要用 LLM 判「是不是同一个答案」（只做子串比对等于把自然语言当字符串）。
           判据仍是先规则后仲裁：子串比对过了就不发仲裁请求，一次配额都不多花。
-          读者自报「缺条件」还要过旁证：机械闸门确认题面写全了识别条件时按误报处理。
+          读者自报「缺条件」还要过旁证：机械校验确认题面写全了识别条件时按误报处理。
     """
 
     class _TripleClient:
         """输入：读者函数 + 仲裁结论。输出：假客户端。
 
-        预期：一个客户端扮三个角色，靠载荷形状分流——L3 载荷带 `answer`、答案仲裁载荷带
-              `expected`、往返检验载荷两者都没有（只有 stem / options）。
+        预期：一个客户端扮三个角色，靠提示内容形状分流——L3 提示内容带 `answer`、答案仲裁提示内容带
+              `expected`、往返检验提示内容两者都没有（只有 stem / options）。
         """
 
         def __init__(self, reader, equivalent: bool = True) -> None:
@@ -1553,16 +1553,16 @@ class AnswerArbitrationWiringTests(unittest.TestCase):
             self.arbitrations = 0
 
         def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
-            """输入：messages。输出：按载荷形状分流后的响应。"""
-            # `payload_of` 只认带 `answer` 的 L3 载荷，所以另外两种载荷先按形状认出来。
+            """输入：messages。输出：按提示内容形状分流后的响应。"""
+            # `payload_of` 只认带 `answer` 的 L3 提示内容，所以另外两种提示内容先按形状认出来。
             body = _last_json_object(messages)
             if "explanation" in body and "answer" not in body:
-                # 措辞检验（L4.7）的载荷：只有 stem / explanation，没有答案也没有候选。
-                # 夹具一律回「没意见」——本类测试钉的不是那条闸门。
+                # 措辞检验（L4.7）的提示内容：只有 stem / explanation，没有答案也没有候选。
+                # 夹具一律回「没意见」——本类测试钉的不是那条校验。
                 return Completion(
                     ok=True, text=json.dumps({"phrases": [], "note": ""}), provider="scripted", model="m"
                 )
-            if "expected" in body:  # 答案仲裁：载荷里带标准答案
+            if "expected" in body:  # 答案仲裁：提示内容里带标准答案
                 self.arbitrations += 1
                 return Completion(
                     ok=True,
@@ -1618,7 +1618,7 @@ class AnswerArbitrationWiringTests(unittest.TestCase):
         self.assertEqual(client.arbitrations, 0)
 
     def test_missing_condition_self_report_is_corroborated(self) -> None:
-        """读者自报「缺条件」，但机械闸门确认题干写全了识别条件 → 按误报处理，照样发布。"""
+        """读者自报「缺条件」，但机械校验确认题干写全了识别条件 → 按误报处理，照样发布。"""
         client = self._TripleClient(lambda _expected, _body: "缺条件")
         rows = self._run(client, "arb_missing.jsonl")
         self.assertEqual(len(rows), 1)
@@ -1626,10 +1626,10 @@ class AnswerArbitrationWiringTests(unittest.TestCase):
 
 
 class SemanticAnswerWiringTests(unittest.TestCase):
-    """输入：机械闸门结论 + 假仲裁客户端。输出：修正过的结论。
+    """输入：机械校验结论 + 假仲裁客户端。输出：修正过的结论。
 
     预期：`answer_in_explanation` 只做**快速通过**——子串没过、而且**只有这一条没过**时才问 LLM；
-          别的闸门也挂了就不花这次配额（救回来照样发布不了）；仲裁缺席维持机械结论（工具问题
+          别的校验也挂了就不花这次配额（救回来照样发布不了）；仲裁缺席维持机械结论（工具问题
           不判数据死刑，也不放行）。
     """
 
@@ -1661,7 +1661,7 @@ class SemanticAnswerWiringTests(unittest.TestCase):
         )
 
     def test_semantic_pass_lifts_the_substring_failure(self) -> None:
-        """解析里没有答案串（子串闸门不过），语义核验判「解析说的就是标准答案」→ 撤掉那条失败。"""
+        """解析里没有答案串（子串校验不过），语义核验判「解析说的就是标准答案」→ 撤掉那条失败。"""
         arbiter = self._Arbiter('{"states_answer": true, "stated": "xié", "reason": "换了个说法"}')
         result = _verified_with_semantic_answer(self._verdict(), self._spec(), None, arbiter)
         self.assertTrue(result.answer_in_explanation)
@@ -1698,7 +1698,7 @@ class SemanticAnswerWiringTests(unittest.TestCase):
         self.assertEqual(arbiter.calls, 0)
 
     def test_other_failures_skip_the_semantic_check(self) -> None:
-        """别的闸门也挂了 → 这一条救回来照样发布不了，不花配额。"""
+        """别的校验也挂了 → 这一条救回来照样发布不了，不花配额。"""
         arbiter = self._Arbiter('{"states_answer": true, "reason": "夹具乱判"}')
         verdict = verify(
             self._spec(),
@@ -1720,8 +1720,8 @@ class SemanticAnswerWiringTests(unittest.TestCase):
 class _SemanticAnswerClient:
     """输入：语义核验的结论。输出：同时扮 L3 与语义核验两个角色的假客户端。
 
-    预期：L3 那一轮返回一份**解析里不写答案串**的规范正文（子串闸门必然不过），语义核验那一轮
-          返回给定结论。靠载荷形状分流：语义核验的载荷带 `explanation`，L3 的带 `facts`。
+    预期：L3 那一轮返回一份**解析里不写答案串**的规范正文（子串校验必然不过），语义核验那一轮
+          返回给定结论。靠提示内容形状分流：语义核验的提示内容带 `explanation`，L3 的带 `facts`。
     """
 
     def __init__(self, verdict: str) -> None:
@@ -1730,7 +1730,7 @@ class _SemanticAnswerClient:
 
     def complete(self, messages, *, temperature: float = 0.6, extra=None) -> Completion:
         body = _last_json_object(messages)
-        if "explanation" in body:  # 语义核验：载荷里只有解析与答案
+        if "explanation" in body:  # 语义核验：提示内容里只有解析与答案
             self.semantic_calls += 1
             return Completion(ok=True, text=self._verdict, provider="scripted", model="m")
         payload = payload_of(messages)
@@ -1761,7 +1761,7 @@ class SemanticAnswerEndToEndTests(unittest.TestCase):
         return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
 
     def test_semantic_pass_publishes_with_a_trace(self) -> None:
-        """子串闸门不过、语义核验判过 → 照样发布，并把仲裁痕迹落进 verification。"""
+        """子串校验不过、语义核验判过 → 照样发布，并把仲裁痕迹落进 verification。"""
         client = _SemanticAnswerClient('{"states_answer": true, "stated": "xié", "reason": "换了个说法"}')
         rows = self._run(client, "sem_pass.jsonl")
         self.assertEqual(len(rows), 1)

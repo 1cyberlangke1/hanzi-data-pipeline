@@ -1,6 +1,6 @@
-"""L4 机械闸门的单元测试。
+"""L4 机械校验的单元测试。
 
-判据只有两类，测试也按这两类分：**载荷里的定死串**（答案、必现串、候选）与**产出自身的形态**
+判据只有两类，测试也按这两类分：**提示内容里的定死串**（答案、必现串、候选）与**产出自身的形态**
 （中文自然语言、数字来源可查、没被截断、没有程序侧的说法）。写法不在这里判——那是 L4.5 / L4.6
 （LLM）的事，本层只做子串 / 集合比对。
 """
@@ -15,7 +15,7 @@ from hanzi_synth.verify.checks import verify
 
 
 def _spec(**overrides) -> TaskSpec:
-    """输入：要覆盖的字段。输出：一道最小可过闸门的题（答案 qiu1，主语 㐀）。
+    """输入：要覆盖的字段。输出：一道最小可过校验的题（答案 qiu1，主语 㐀）。
     预期：不传 overrides 时 `verify` 必须给 tier A——这样每条用例的失败原因都能归到被改的那一项。
     """
     base = dict(task_id="T_test", instruction="i", facts={}, answer="qiu1", visible_subject="㐀")
@@ -24,7 +24,7 @@ def _spec(**overrides) -> TaskSpec:
 
 
 def _verbalized(stem: str = "「㐀」的读音是什么？", explanation: str = "「㐀」读作 qiu1。") -> Verbalized:
-    """输入：题干与解析。输出：L3 产出替身。预期：默认值能过全部机械闸门。"""
+    """输入：题干与解析。输出：L3 产出替身。预期：默认值能过全部机械校验。"""
     return Verbalized(ok=True, stem=stem, explanation=explanation)
 
 
@@ -36,7 +36,7 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(result.failures, ())
 
     def test_schema_failure_short_circuits(self) -> None:
-        """槽位为空：当场判 schema 不合格，不再往下判（下游判据都假设槽位有内容）。"""
+        """位置为空：当场判 schema 不合格，不再往下判（下游判据都假设位置有内容）。"""
         result = verify(_spec(), Verbalized(ok=False, stem="", explanation=""))
         self.assertFalse(result.schema)
         self.assertEqual(result.tier, "C")
@@ -125,7 +125,7 @@ class OutputFormTests(unittest.TestCase):
         self.assertEqual(result.tier, "C")
 
     def test_numbers_must_come_from_the_payload(self) -> None:
-        """产出里的阿拉伯数字必须在载荷里找得到，否则就是凭空造的（笔画数、码位最容易编）。"""
+        """产出里的阿拉伯数字必须在提示内容里找得到，否则就是凭空造的（笔画数、码位最容易编）。"""
         result = verify(_spec(), _verbalized(stem="「㐀」一共 7 画，读音是什么？"))
         self.assertFalse(result.numbers_from_facts)
         self.assertEqual(result.tier, "C")
@@ -155,7 +155,7 @@ class OutputFormTests(unittest.TestCase):
         spec = _spec(facts={"meaning_source": source})
         copied = verify(spec, _verbalized(stem=f"「㐀」的读音是什么？{source}"))
         self.assertFalse(copied.no_source_copy)
-        # 被拒时模型必须拿到「换个说法」这句人话，而不是闸门名 + 判据说明
+        # 被拒时模型必须拿到「换个说法」这句人话，而不是校验名 + 判据说明
         self.assertEqual(len(copied.notes), len(copied.failures))
         self.assertTrue(any("照抄" in note for note in copied.notes), copied.notes)
         rewritten = verify(spec, _verbalized(stem="古代有一种用来盛放祭品的礼器，这个字指的就是它，它读什么？"))
@@ -165,7 +165,7 @@ class OutputFormTests(unittest.TestCase):
 class InternalTermsTests(unittest.TestCase):
     """产出必须**上下文无关**：读者手里只有这道题本身，不知道什么叫「题干」「载荷」「槽位」「IDS」。
 
-    实测：2B 会把 instruction 里的字段名（`stem_must_contain` / `facts.conditions`）意译成
+    实测：小模型会把 instruction 里的字段名（`stem_must_contain` / `facts.conditions`）意译成
     「题干描述的…」「提供的汉字」「下列字形」，也会把英文缩写连夹注一起抄进中文题干
     （「请说明字符㐀的 IDS（ideographic description sequence）分解方式」）。
     """
@@ -189,7 +189,7 @@ class InternalTermsTests(unittest.TestCase):
     def test_source_citation_framing_in_explanation_is_rejected(self) -> None:
         """解析里带「根据《…》/ 康熙字典 / 集韵」这类**引用框架** → 否决。
 
-        实测（`llm_semantic.jsonl` 3,467 条里 900+ 条）：2B 会把出处写进产出，
+        实测（`llm_semantic.jsonl` 3,467 条里 900+ 条）：小模型会把出处写进产出，
         形态远不止 `出自《` 一种。判据是「产出里有没有出现这种说法」这件事实，
         不是「该怎么写」——所以它挡得住，也不会把正常解释误伤。
         """
@@ -211,7 +211,7 @@ class InternalTermsTests(unittest.TestCase):
         """解析里写「根据资料 / 根据给定」= 把出题人视角的话漏给读者：读者手上没有那份资料。
 
         实测全量 710,655 条里 27 条这样，全在解析里（旧提示词 26 条、当前提示词 1 条）——
-        机械闸门原先只认「提供的」这一类，整类漏网。
+        机械校验原先只认「提供的」这一类，整类漏网。
         """
         for phrase in ("根据资料，「㐀」读作 qiu1。", "根据给定的信息，这个字读 qiu1。",
                        "资料显示，「㐀」读作 qiu1。"):
@@ -226,12 +226,12 @@ class InternalTermsTests(unittest.TestCase):
         self.assertFalse(result.no_internal_terms)
 
     def test_clean_text_has_no_internal_terms(self) -> None:
-        """基线：干净产出这一条必须过，否则这条闸门就是在误杀。"""
+        """基线：干净产出这一条必须过，否则这条校验就是在误杀。"""
         self.assertTrue(verify(_spec(), _verbalized()).no_internal_terms)
 
 
 class FieldNameTests(unittest.TestCase):
-    """载荷**键名**不得出现在正文里：键名是程序侧的英文标识符，读者只该看到键对应的**值**。"""
+    """提示内容**键名**不得出现在正文里：键名是程序侧的英文标识符，读者只该看到键对应的**值**。"""
 
     def test_facts_key_must_not_appear_in_prose(self) -> None:
         """实测 T1 解析写「「㐀」的 stroke_total 为 5」——字段名漏进了散文。"""
@@ -248,7 +248,7 @@ class FieldNameTests(unittest.TestCase):
         self.assertEqual(result.tier, "A")
 
     def test_payload_field_name_is_rejected(self) -> None:
-        """载荷字段名（`instruction` 这类）同样不得进正文——它比 facts 的键更不像人话。"""
+        """提示内容字段名（`instruction` 这类）同样不得进正文——它比 facts 的键更不像人话。"""
         result = verify(_spec(), _verbalized(explanation="按 instruction 的要求，「㐀」读作 qiu1。"))
         self.assertFalse(result.no_field_names)
         self.assertEqual(result.tier, "C")
@@ -274,7 +274,7 @@ class MarkerEnumerationTests(unittest.TestCase):
         self.assertEqual(result.tier, "C")
 
     def test_a_normal_question_hits_few_markers(self) -> None:
-        """正常问句命中一两个说法是闸门本来就要求的，不算罗列。"""
+        """正常问句命中一两个说法是校验本来就要求的，不算罗列。"""
         spec = _spec(stem_asks_any=self._MARKERS)
         result = verify(spec, _verbalized(stem="「㐀」读作什么？"))
         self.assertTrue(result.no_marker_enumeration)
@@ -295,16 +295,16 @@ class MarkerEnumerationTests(unittest.TestCase):
 
 
 class ForeignWordTests(unittest.TestCase):
-    """正文必须是中文散文：夹进来的英文词要么是载荷里的数据，要么是标准术语。"""
+    """正文必须是中文散文：夹进来的英文词要么是提示内容里的数据，要么是标准术语。"""
 
     def test_stray_english_word_is_rejected(self) -> None:
-        """实测 T3 写「结构 notation 字符串」——notation 既不是载荷里的值也不是标准术语。"""
+        """实测 T3 写「结构 notation 字符串」——notation 既不是提示内容里的值也不是标准术语。"""
         result = verify(_spec(), _verbalized(explanation="「㐀」读作 qiu1，notation 是英文词。"))
         self.assertFalse(result.no_foreign_words)
         self.assertEqual(result.tier, "C")
 
     def test_payload_value_in_ascii_is_allowed(self) -> None:
-        """载荷里的 ASCII 值（码位、字节序列）本来就该原样出现。"""
+        """提示内容里的 ASCII 值（码位、字节序列）本来就该原样出现。"""
         spec = _spec(facts={"codepoint": "U+3400"}, answer="U+3400")
         result = verify(spec, _verbalized(stem="「㐀」的码位是什么？", explanation="「㐀」的码位是 U+3400。"))
         self.assertTrue(result.no_foreign_words)
@@ -319,7 +319,7 @@ class ForeignWordTests(unittest.TestCase):
 
 
 class EscapeArtifactTests(unittest.TestCase):
-    """正文里不得有字面的反斜杠：实测 2B 会吐出字面的 \\n，发布出去读者看到的是「…的字。\\n选项…」。"""
+    """正文里不得有字面的反斜杠：实测小模型会吐出字面的 \\n，发布出去读者看到的是「…的字。\\n选项…」。"""
 
     def test_literal_backslash_is_rejected(self) -> None:
         result = verify(_spec(), _verbalized(stem="「㐀」的读音是什么？\\n请作答。"))
@@ -355,7 +355,7 @@ class PlaceholderLeakTests(unittest.TestCase):
 class ExplanationProseTests(unittest.TestCase):
     """解析必须是**一句说明**，不能只是光秃答案。
 
-    真机实测（本地 2B，`run --limit 4`）：T9 的解析就回了一个「七」——`answer_in_explanation`
+    真机实测（本地小模型，`run --limit 4`）：T9 的解析就回了一个「七」——`answer_in_explanation`
     只查「答案串在不在解析里」，光秃答案天然在，于是裸值直接进了数据集。
     """
 
@@ -375,7 +375,7 @@ class ExplanationProseTests(unittest.TestCase):
         self.assertTrue(verify(_spec(), _verbalized()).explanation_is_prose)
 
     def test_minimal_wrapper_around_the_answer_passes(self) -> None:
-        """边界：只有答案 + 一层包装词（「答案是「qiu1」。」）也算说明——这条闸门判的是
+        """边界：只有答案 + 一层包装词（「答案是「qiu1」。」）也算说明——这条校验判的是
         「除了答案还有没有话」，不判那句话写得好不好（好不好是 L4.6 往返检验的事）。"""
         result = verify(_spec(), _verbalized(explanation="答案是「qiu1」。"))
         self.assertTrue(result.explanation_is_prose)
@@ -390,9 +390,9 @@ class FeedbackNoteTests(unittest.TestCase):
     """`notes` 是 failures 的**模型侧**说法，只回灌给措辞模型。
 
     预期：与 failures 一一对应（同序同长）；**模板一律中文**——合成的是中文数据，中英混排会让
-          2B 多一道翻译并译错；模板刻意用 `_INTERNAL_TERMS` 里的词（题干 / 载荷 / 必现串），
+          小模型多一道翻译并译错；模板刻意用 `_INTERNAL_TERMS` 里的词（题干 / 提示内容 / 必现串），
           模型把反馈原文抄进产出时 `no_internal_terms` 当场拦下。
-          提示里可以出现载荷里的汉字与 ASCII 值（缺的串、答案），那是数据不是模板。
+          提示里可以出现提示内容里的汉字与 ASCII 值（缺的串、答案），那是数据不是模板。
     """
 
     def test_clean_output_has_no_notes(self) -> None:
@@ -407,10 +407,10 @@ class FeedbackNoteTests(unittest.TestCase):
     def test_every_note_is_chinese_prose(self) -> None:
         """每一条模型侧反馈都必须含汉字，且与 failures **同序同长**。
 
-        逐条触发一遍闸门，再查有没有「一个汉字都没有」的反馈——那样的一条就是英文模板漏回了
+        逐条触发一遍校验，再查有没有「一个汉字都没有」的反馈——那样的一条就是英文模板漏回了
         模型上下文（中英混排会多一道翻译并译错）。
-        同时逐条断言 `len(notes) == len(failures)`：闸门加了 failures 却忘了配套 note 时，
-        `_run_one` 只能把带闸门名的原文回灌给模型（实测 `no_source_copy` 就是这样漏的）。
+        同时逐条断言 `len(notes) == len(failures)`：校验加了 failures 却忘了配套 note 时，
+        `_run_one` 只能把带校验名的原文回灌给模型（实测 `no_source_copy` 就是这样漏的）。
         """
         cases = (
             (_spec(), _verbalized(stem="What is the reading?")),

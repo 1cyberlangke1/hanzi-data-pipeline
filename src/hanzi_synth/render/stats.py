@@ -3,7 +3,7 @@
 输入：chars.jsonl + 题型白名单 + 每型取样几个字 + 种子。
 输出：{题型: {samples, space, stems, verified, explanations, skeletons, skeleton_tails, seconds}}。
 预期：**穷举整段句式空间**，不是抽样——「每型 ≥500 种句式」这条指标只有穷举才说得准，
-      抽样只能给下界。取样按池子顺序取每种题型的头 N 个字（确定性、可复现）；
+      抽样只能给下界。取样按字库顺序取每种题型的头 N 个字（确定性、可复现）；
       同一题型换一个字就换一批事实，所以句式集合要取并集。
 
 「不同句式」不是一个数，是三层，所以三个都报，免得把最外层误读成最里层：
@@ -46,9 +46,9 @@ def census(spec: TaskSpec) -> Census:
     """输入：一条 TaskSpec。输出：`Census`（见上面的字段说明）。
     预期：把这道题的**整个**句式空间枚举一遍（题干 × 解析写法，两者都是独立轴）。渲染不出来的
           变体（非选择题的答案落在题干里，`render` 返回 None）按设计直接跳过，不进任何集合。
-          `verified` 是 `stems` 的子集，两者相等就说明模板池渲染出的每一句都过得了 L4 闸门。
-          闸门要连解析一起看（`answer_in_explanation` / `numbers_from_facts` 都读解析），
-          所以每一对 (题干, 解析) 都真过一遍，不拿「解析不影响闸门」当理由跳验。
+          `verified` 是 `stems` 的子集，两者相等就说明模板池渲染出的每一句都过得了 L4 校验。
+          校验要连解析一起看（`answer_in_explanation` / `numbers_from_facts` 都读解析），
+          所以每一对 (题干, 解析) 都真过一遍，不拿「解析不影响校验」当理由跳验。
     """
     space = O.variant_space(spec)
     result = Census(space=space)
@@ -78,7 +78,7 @@ def measure(
 ) -> dict[str, dict[str, Any]]:
     """输入：数据路径 + 题型白名单 + 每型取样数 + 种子 + 进度回调。输出：{题型: 统计}。
     预期：每个题型取头 `per_type` 个字做样本；取不满就按实际条数算并如实记进 `samples`，
-          不假装取满。题型在池子里一个字都出不来时给全 0，不静默消失。
+          不假装取满。题型在字库里一个字都出不来时给全 0，不静默消失。
     """
     say = progress or (lambda _msg: None)
     characters = load_characters(data_path)
@@ -139,7 +139,7 @@ def measure(
         say(
             f"{task_id}: 句式空间 {space}，不同句式 {len(stems)}"
             f"（问法骨架 {len(skeletons)}，骨架×收尾 {len(skeleton_tails)}），"
-            f"其中过闸门 {len(verified)}，不同解析 {len(explanations)}"
+            f"其中过校验 {len(verified)}，不同解析 {len(explanations)}"
             f"（{report[task_id]['seconds']}s）"
         )
     return report

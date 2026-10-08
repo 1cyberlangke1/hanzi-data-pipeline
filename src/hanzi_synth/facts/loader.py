@@ -1,10 +1,10 @@
 """chars.jsonl 加载与准入过滤。
 
-准入规则（findings.md §9.7 定稿 + 本次收紧），**两道闸门都过才进池**：
+准入规则：**两道校验都过才进字库**：
 1. **字形写得出来**：`property.zi` 非空。为空的那批是字海内部编号记录（ziid 形如 `Z31607` /
    `P...`，没有 Unicode 码位；`standard_form` 要么指向「同形的另一条记录」要么是 `000516`
    这类占位串，不能拿来当本字的字形）。任何一道题都要先把字写出来才能问，写不出来的记录
-   一条题都出不了，放进池子只会让渲染器把主语填成空串；
+   一条题都出不了，放进字库子只会让渲染器把主语填成空串；
 2. **解析出 >=1 个「语法完整」的 IDS 候选**。其余字段（释义 / 部首 / 读音 / 码位）不作准入条件。
 
 「语法完整」= 用 ids.parse_tree 能完整消费（描述符元数够）。
@@ -29,7 +29,7 @@ class DataError(RuntimeError):
 
 def _complete_candidates(candidates: tuple[str, ...]) -> tuple[str, ...]:
     """输入：词法合法的候选元组。输出：只保留能被 parse_tree 完整解析的候选。
-    预期：全部残缺时返回空元组——该字据此判为「无可用 IDS」，不进池。
+    预期：全部残缺时返回空元组——该字据此判为「无可用 IDS」，不进字库。
     """
     out: list[str] = []
     for candidate in candidates:
@@ -43,17 +43,17 @@ def _complete_candidates(candidates: tuple[str, ...]) -> tuple[str, ...]:
 
 def _to_character(raw: dict) -> Character | None:
     """输入：一条原始记录 dict。输出：Character，或 None（没有可用 IDS 时）。
-    预期：字段缺失按 None/0 兜底，不因为个别脏字段丢整条；但**字形（`zi`）与 IDS 是准入条件**，
+    预期：字段缺失按 None/0 保底，不因为个别脏字段丢整条；但**字形（`zi`）与 IDS 是准入条件**，
           缺了它们这条记录本身就不成立（写不出来、拆不开），直接出局。
     """
     prop = raw.get("property") or {}
-    # 准入闸门一：**写不出来的字不进池**。`zi` 为空 = 没有字形可问（见模块注释），
+    # 准入校验一：**写不出来的字不进字库**。`zi` 为空 = 没有字形可问（见模块注释），
     # 放进来只会渲染出「从出发，取上边的部件…」这种空主语句。
     if not str(prop.get("zi") or "").strip():
         return None
     candidates = _complete_candidates(parse_candidates(prop.get("ids")))
     if not candidates:
-        return None  # 准入闸门二：无可用 IDS 直接出局
+        return None  # 准入校验二：无可用 IDS 直接出局
 
     meanings = raw.get("meanings") or {}
     normalized_meanings = {
@@ -120,7 +120,7 @@ def iter_characters(
     limit: int | None = None,
 ) -> Iterator[Character]:
     """输入：chars.jsonl 路径（默认 crawler/data/chars.jsonl）、条数上限。
-    输出：惰性迭代进池的 Character。
+    输出：惰性迭代进字库的 Character。
     预期：文件不存在时抛 DataError；坏行报出具体行号；limit 在**过滤后**计数。
     """
     target = Path(path) if path is not None else default_data_path()
@@ -147,5 +147,5 @@ def iter_characters(
 
 
 def load_characters(path: Path | str | None = None, *, limit: int | None = None) -> list[Character]:
-    """输入：同 iter_characters。输出：进池字的列表。预期：小批量验证用，全量请用迭代器。"""
+    """输入：同 iter_characters。输出：进字库字的列表。预期：小批量验证用，全量请用迭代器。"""
     return list(iter_characters(path, limit=limit))

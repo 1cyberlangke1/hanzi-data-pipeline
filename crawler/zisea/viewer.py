@@ -4,7 +4,7 @@
 输出：本机 http://127.0.0.1:8720 的浏览界面，支持检索与单字详情
 预期：默认纯离线，只用标准库、不访问外网。本地缺精灵图时回 404，前端退化成占位符；
       只有显式开启 allow_origin_fetch（CLI: --allow-origin-fetch）才会回源站点代理取图 ——
-      默认关闭是为了让查看器不绕过爬虫的 robots.txt 闸门。
+      默认关闭是为了让查看器不绕过爬虫的 robots.txt 校验。
 
 免责声明：本工具仅供学习交流，数据版权归原站所有，不对外提供数据分发。
 """
@@ -61,7 +61,7 @@ class Entry:
     text: str
 
     def to_list(self) -> list:
-        """输入：无。输出：紧凑数组，用于落盘索引（比对象省一半以上体积）。"""
+        """输入：无。输出：紧凑数组，用于写入文件索引（比对象省一半以上体积）。"""
         return [self.ziid, self.zi, self.ye, self.pinyin, self.radical, self.stroke, self.offset, self.text]
 
     @classmethod
@@ -229,7 +229,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     index: ViewerIndex
     base_url: str = DEFAULT_BASE_URL
-    # 默认不回源：保持查看器纯离线，也避免绕过爬虫的 robots.txt 闸门。
+    # 默认不回源：保持查看器纯离线，也避免绕过爬虫的 robots.txt 校验。
     allow_origin_fetch: bool = False
     server_version = "ZiseaViewer/1.0"
 
@@ -252,7 +252,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self._handle_sprite(parsed.path.rsplit("/", 1)[-1])
             else:
                 self._send_json({"error": "未知路径"}, status=404)
-        except Exception as exc:  # noqa: BLE001 - 顶层兜底，避免线程里抛裸异常
+        except Exception as exc:  # noqa: BLE001 - 顶层保底，避免线程里抛裸异常
             self._send_json({"error": f"服务内部错误：{exc}"}, status=500)
 
     def _handle_search(self, query: dict) -> None:

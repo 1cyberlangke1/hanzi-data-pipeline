@@ -1,33 +1,33 @@
 """L3 自然语言化：LLM 唯一出场的地方。
 
-契约（synthesis/README.md §7）：
-- 输入是**已确定的事实 JSON**，LLM 只填题面（`Q`）与回答（`A`）两个槽位；
+契约：
+- 输入是**已确定的事实 JSON**，LLM 只填题面（`Q`）与回答（`A`）两个位置；
 - 输出必须是**单个 JSON 对象**，不得带 markdown 围栏或解释性前后缀；
 - 数值 / 字符 / IDS 必须**原样引用** facts，不得换算、不得改写；
-- 题干**不得包含答案**（这条由 L4 校验器兜底，不只靠提示词）。
+- 题干**不得包含答案**（这条由 L4 校验器保底，不只靠提示词）。
 
 思考段在 provider 层已被无条件剥离，这里拿到的 text 一定是剥干净的。
 
 提示词分两处，**都不给输入/输出贴标签**：SYSTEM_PROMPT（两句：一句任务 + 一句格式要求）与
 FEW_SHOT_TURNS（四条**真实对话轮次**）——短、正向、只讲这一个任务，写法靠示例给，不靠规则墙。
 
-每一处都是实测出来的（6 题型，本地 2B，温度 0.6，落盘 synthesis/out/probe_prompt_v9 10
+每一处都是实测出来的（6 题型，本地小模型，温度 0.6，写入文件 synthesis/out/probe_prompt_v9 10
 11 13 14 15）：
 - 示范**留两条是下限**：砍成一条时 A 写成光秃答案的从 5/12 涨到 11/12；
 - 格式要求写成**正向**一句「A 写成一句完整的话」：光秃答案 7/12 → 0/12（禁令它不执行）；
 - instruction 用**名词性短语**（「「㐀」的总笔画数」）：整句照抄出题说明 9/12 → 0/12，
-  且 12/12 都落成了问句。写成完整问句时 2B 会把它原样搬进题干，数据集里就是程序回声；
+  且 12/12 都落成了问句。写成完整问句时小模型会把它原样搬进题干，数据集里就是程序回声；
 - 系统提示**再砍一句**（删掉「数字、字符、[[1]] 一律原样照抄」）：光秃答案 3/12 → 0/12、
-  tier A 6/12 → 7/12——多出来的那半句 2B 根本没执行，只是白占上下文；
-- 示范**加到三条**（第三条是反向认字）+ 载荷去掉与顶层同值的 options / nswer_zi：
+  tier A 6/12 → 7/12——多出来的那半句小模型根本没执行，只是白占上下文；
+- 示范**加到三条**（第三条是反向认字）+ 提示内容去掉与顶层同值的 options / nswer_zi：
   6 型 tier A 5/12 → 8/12，T13 的 subject_in_stem 失败 2/12 → 0~1/12。
-- 闸门要求的串（候选 / 位置链 / 读音 + 释义）**写进 `instruction`**：它们是「要问什么」的一部分，
-  只放在 facts 里 2B 不捞——四个选择题型候选列全 0/8、tier A 0/8；写进说明后 8/8 列全、
+- 校验要求的串（候选 / 位置链 / 读音 + 释义）**写进 `instruction`**：它们是「要问什么」的一部分，
+  只放在 facts 里小模型不捞——四个选择题型候选列全 0/8、tier A 0/8；写进说明后 8/8 列全、
   tier A 11/12（probe_weave.jsonl）。T9 的必现位置词 0/2 → 2/2，T13 的读音 3/3、释义 3/3
   （probe_t13.jsonl）。
 
 `instruction` 是题型自己给的一句「要问什么」，不带「问读者」这类程序口吻——带了口吻，
-2B 会连口吻一起抄进产出。说明里的生僻字与候选一样换成占位符（`payload_for` 统一做），
+小模型会连口吻一起抄进产出。说明里的生僻字与候选一样换成占位符（`payload_for` 统一做），
 模型照抄说明时不必自己敲生僻字。
 另外重试时会把上一轮被拒的原因作为 `feedback` 追加一轮用户消息（reflexion），
 把「猜哪里错了」变成「按原因改」。
@@ -54,32 +54,32 @@ from .provider import ChatClient
 # 加了之后同一批题 0 次——小模型只执行**正向的格式要求**，禁令（「别只写答案」）它不执行。
 # 两句新增的要求都是**正向**的（禁令小模型不执行，实测），各自对应一个量出来的毛病：
 #   「换一种问法开头」：产出数据里 T13 有 67% 的题干都以「有一个字读作」开头、T17 只有 84 种句式
-#     （最常见那句占 34%）——void_openings 只是把用过的题干列出来，2B 不会自己去比，得明说；
+#     （最常见那句占 34%）——void_openings 只是把用过的题干列出来，小模型不会自己去比，得明说；
 #   「事实照原意写」：实测 T13 把 䢂 的释义「粤语读音lip1、为英语"lift"的音译」写成了「意思与机械相关」，
 #     既丢原意又和另一个字（䡃「绞车机械」）撞成逐字相同的题干。
 # 原先还有半句「数字、字符、[[1]] 一律原样照抄」，实测多余：删掉后光秃答案 3/12 → 0/12、
 # tier A 6/12 → 7/12（probe_prompt_v13），数值照样照抄——示范已经把这件事演出来了。
 SYSTEM_PROMPT = "把给你的 JSON 写成一道自然的汉字问答：换一种问法开头，别和已给的那些重复；事实照原意写，别换成更笼统的说法。只回一个 JSON 对象：{\"Q\": \"...\", \"A\": \"...\"}，A 写成一句完整的话。"
 
-# 四条示范轮次（输入, 输出），都与真实载荷**同形**：
+# 四条示范轮次（输入, 输出），都与真实提示内容**同形**：
 # 1. 说明是**名词性短语**（「「木」的总笔画数」），跟构造器给的写法一致——说明写成完整问句时
-#    2B 会整句照抄（实测 12 次里 9 次），改成名词性短语后 0 次；
+#    小模型会整句照抄（实测 12 次里 9 次），改成名词性短语后 0 次；
 # 2. 选择题的说明**把候选写在句首**（`[[1]]、[[2]]、[[3]]、[[4]] 里总笔画数最少的那个字`）：
-#    闸门要求题干逐个列出候选，而只写「候选里」时 2B 一个都不列（4 个选择题型 × 2 条：候选
-#    列全 0/8、tier A 0/8；写成说明的主语后 8/8 列全，probe_weave.jsonl）。示范必须与真载荷
-#    同形，否则 2B 学到的是另一套形状。
+#    校验要求题干逐个列出候选，而只写「候选里」时小模型一个都不列（4 个选择题型 × 2 条：候选
+#    列全 0/8、tier A 0/8；写成说明的主语后 8/8 列全，probe_weave.jsonl）。示范必须与真提示内容
+#    同形，否则小模型学到的是另一套形状。
 # 3. / 4. 两条是**反向认字**（靠读音 + 释义认出那个字，再问它的部件结构式）：前两条都是正向题，
-#    2B 没见过「题干要把识别条件写出来」这种形状，T13 的题干只写「这个字…」——补上示范后
+#    小模型没见过「题干要把识别条件写出来」这种形状，T13 的题干只写「这个字…」——补上示范后
 #    subject_in_stem 失败从 2/12 降到 0~1/12（probe_prompt_v14 / v15）。
-#    **为什么是两条、且两条都问「部件结构式」**（实测：本地 2B，温度 0.6，同一批计划逐臂只换示范，
-#    落盘 synthesis/out/probe_t13_style.log 与 probe_t13_style_ef.log）：
+#    **为什么是两条、且两条都问「部件结构式」**（实测：本地小模型，温度 0.6，同一批计划逐臂只换示范，
+#    写入文件 synthesis/out/probe_t13_style.log 与 probe_t13_style_ef.log）：
 #    | 反向示范 | 唯一句式 | 最常见句式占比 | 开头种数 | tier A |
 #    | 1 条，问「它是哪个字」 | 22/32 | 34.4% | 3 | 29/32 |
 #    | 1 条，问「部件结构式」 | 38/48 | 16.7% | 4 | 41/48 |
 #    | 2 条，都问「部件结构式」 | 46/48 | 4.2% | 14 | 39/48 |
 #    两个量出来的毛病：①**示范的问法会被整句搬走**——问「它是哪个字」时 T13 题干真的写
-#    「它是哪个字？」，而 T13 的答案不是那个字、是它的部件结构式，闸门判 tier C（3/32）；
-#    问「部件结构式」时同一批 39/48 落 tier A。②**只有一条示范时 2B 只学得到一个形状**，
+#    「它是哪个字？」，而 T13 的答案不是那个字、是它的部件结构式，校验判 tier C（3/32）；
+#    问「部件结构式」时同一批 39/48 落 tier A。②**只有一条示范时小模型只学得到一个形状**，
 #    最常见句式占 34.4%、开头只有 3 种；给两条不同开头的（「哪一个字…」/「意思是…，读音是…」）
 #    才有第二个形状可挑——最常见句式掉到 4.2%、开头 14 种。
 #    T17 同批对照（20 条一臂）：tier A 14/20 → 18/20，句式多样性不降——加这两条不伤别的题型。
@@ -139,8 +139,8 @@ FEW_SHOT_TURNS: tuple[tuple[dict[str, Any], dict[str, str]], ...] = (
 )
 
 
-# 示范载荷的**原文**（与 `_few_shot_messages` 里发给模型的一模一样）：`payload_of` 靠它把示范
-# 与「这一次真要写的那道题」分开——两边形状相同，不排掉示范就会把示范当成真载荷。
+# 示范提示内容的**原文**（与 `_few_shot_messages` 里发给模型的一模一样）：`payload_of` 靠它把示范
+# 与「这一次真要写的那道题」分开——两边形状相同，不排掉示范就会把示范当成真提示内容。
 _FEW_SHOT_BLOBS = frozenset(
     json.dumps(item, ensure_ascii=False, indent=2) for item, _reply in FEW_SHOT_TURNS
 )
@@ -149,7 +149,7 @@ _FEW_SHOT_BLOBS = frozenset(
 def _few_shot_messages() -> list[dict[str, str]]:
     """输入：无。输出：示范轮次的 messages（用户消息=输入 JSON，助手消息=输出 JSON）。
     预期：单题与批量共用的静态前缀；角色本身就说明了哪份是输入、哪份是输出，所以示范里一个
-          标签都不写——标签会被 2B 抄进产出。
+          标签都不写——标签会被小模型抄进产出。
     """
     out: list[dict[str, str]] = []
     for demo_in, demo_out in FEW_SHOT_TURNS:
@@ -159,11 +159,11 @@ def _few_shot_messages() -> list[dict[str, str]]:
 
 
 # 重试反馈的开头与结尾，**一律中文**：合成的是中文数据，程序侧文本也一律中文——
-# 中英混排会让 2B 多一道翻译并译错（真机把 `reading` 译成「阅读」）。
-# 反馈正文里的原因来自 L4 闸门；模型若把反馈原文抄进产出，会被 `no_internal_terms` 拦下。
+# 中英混排会让小模型多一道翻译并译错（真机把 `reading` 译成「阅读」）。
+# 反馈正文里的原因来自 L4 校验；模型若把反馈原文抄进产出，会被 `no_internal_terms` 拦下。
 FEEDBACK_HEADER = "刚才那版没通过，按下面的意见重写。"
-# 结尾必须再写一次输出格式：反馈很长，2B 读完就丢掉了系统提示里的格式要求（实测第二轮
-# 整段输出散文 / 把载荷原样回显）。放在**最后**一行是刻意的——离生成最近的那句最管用。
+# 结尾必须再写一次输出格式：反馈很长，小模型读完就丢掉了系统提示里的格式要求（实测第二轮
+# 整段输出散文 / 把提示内容原样回显）。放在**最后**一行是刻意的——离生成最近的那句最管用。
 FEEDBACK_FOOTER = '只回一个 JSON 对象：{"Q": "...", "A": "..."}，A 写成一句完整的话'
 
 # 批量模式的补充系统提示：用户给的 JSON 从「一道题」变成「一个 items 数组」。
@@ -215,7 +215,7 @@ class Verbalized:
 def _is_rare_char(char: str) -> bool:
     """输入：单个字符。输出：它是不是「生僻」到不该让模型自己敲的字。
     预期：基本区（U+4E00–U+9FFF）之外、又不是 ASCII 可见字符的，都算生僻——
-          扩展 A 区（㐀 一类）与扩展 B 区以上（𬚮 一类）2B 模型经常写错或整个写丢。
+          扩展 A 区（㐀 一类）与扩展 B 区以上（𬚮 一类）小模型经常写错或整个写丢。
     """
     if not isinstance(char, str) or len(char) != 1:
         return False
@@ -225,7 +225,7 @@ def _is_rare_char(char: str) -> bool:
 
 def _alias_map(spec: TaskSpec) -> dict[str, str]:
     """输入：TaskSpec。输出：{占位符: 真字} 对照表（只收生僻字，顺序稳定）。
-    预期：载荷里凡是要求模型**写出某个生僻字**的槽位（选项、隐藏主语）都换成占位符，
+    预期：提示内容里凡是要求模型**写出某个生僻字**的位置（选项、隐藏主语）都换成占位符，
           模型只写 `[[1]]` 这类记号，真字由程序回填——产出里的生僻字一定是程序放的，
           模型不必自己敲，也就不会敲错、敲丢。
     """
@@ -256,7 +256,7 @@ def _restore_aliases(text: str, aliases: Mapping[str, str]) -> str:
     # 形态（实测 T11 出现过一次），先还原成记号本身再回填，免得「明明写了却被判成没写」。
     text = text.replace("\\[", "[").replace("\\]", "]")
     # 记号内部也偶尔被写松（`[[4] ]`、`[[ 4 ]]`）：先把记号内部的空白收掉再回填。
-    # 实测（probe_noinstr.jsonl，T10 U03402）漏一个空格就让占位符原样落进题干、被闸门判 tier C——
+    # 实测（probe_noinstr.jsonl，T10 U03402）漏一个空格就让占位符原样落进题干、被校验判 tier C——
     # 那条数据本来是对的，白扔一次重试。
     text = _ALIAS_SPACING.sub(r"[[\1]]", text)
     for token, char in aliases.items():
@@ -281,18 +281,18 @@ def _with_restored_aliases(result: Verbalized, aliases: Mapping[str, str]) -> Ve
 
 # 发给模型的 `facts` 要做两件事：只留这道题要引用的键，并去掉顶层已经给过的字段。
 #
-# 一、**只留 `spec.payload_facts` 声明的键**。构造器的 `facts` 是给闸门 / 离线渲染用的全集
+# 一、**只留 `spec.payload_facts` 声明的键**。构造器的 `facts` 是给校验 / 离线渲染用的全集
 #     （判分要读它、干扰项要读它、模板要读它），措辞模型只需要「写这道题要引用的那几个值」。
 #     全发时模型会拿别的题的材料当素材——实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，
 #     产出写成「给出码位 E3 90 8B，让读者从下列选项中选出对应的字」（那条已在构造器侧收窄）；
 #     T1 问笔画却带着 `radical` 与 `ids`。示范（`FEW_SHOT_TURNS`）的 facts 形状就是裁剪后的样子。
-#     实测（probe_payload_ab，本地 2B，11 型 × 4 字 × 2 臂）：tier A 不降、不同题干数不降，
-#     平均载荷 206 → 172 字符。
+#     实测（probe_payload_ab，本地小模型，11 型 × 4 字 × 2 臂）：tier A 不降、不同题干数不降，
+#     平均提示内容 206 → 172 字符。
 #     裁**过头**会掉质量：T16 一开始只发 `codepoint`，产出写十进制「13314」时
-#     `numbers_from_facts` 判「这个数字载荷里没有」——所以 T16 的键里有 `codepoint_forms`。
+#     `numbers_from_facts` 判「这个数字提示内容里没有」——所以 T16 的键里有 `codepoint_forms`。
 #
 # 二、**去掉顶层已经给过的字段**：`options`（顶层那份是占位符化过的）与 `answer_zi`
-#     （与顶层 `answer` 同值）。留着它们不只是白占上下文——实测 2B 会照 facts 里那份
+#     （与顶层 `answer` 同值）。留着它们不只是白占上下文——实测小模型会照 facts 里那份
 #     **原始生僻字**写题干，绕开占位符回填（probe_prompt_v13 里 T11/T16 的题干直接把生僻字敲了出来）。
 def _payload_facts(spec: TaskSpec) -> dict[str, Any]:
     """输入：TaskSpec。输出：给模型的 facts。
@@ -310,10 +310,10 @@ def _payload_facts(spec: TaskSpec) -> dict[str, Any]:
 
 
 def _alias_deep(value: Any, aliases: Mapping[str, str]) -> Any:
-    """输入：载荷里的任意 JSON 值 + 占位符对照表。输出：把其中所有生僻字换成记号后的同形值。
-    预期：**整份载荷用同一套记号**——模型看到的是一个自洽的世界（说明、候选、答案、facts 里的
+    """输入：提示内容里的任意 JSON 值 + 占位符对照表。输出：把其中所有生僻字换成记号后的同形值。
+    预期：**整份提示内容用同一套记号**——模型看到的是一个自洽的世界（说明、候选、答案、facts 里的
           字都是同一个记号），它才分得清「笔画最少的是哪一个」；只给候选取记号、facts 里留真字时
-          2B 无从对照，会写出自相矛盾的解析（实测 T11 产出「笔画最少的是𡲗，对应字是㐂」——
+          小模型无从对照，会写出自相矛盾的解析（实测 T11 产出「笔画最少的是𡲗，对应字是㐂」——
           「𡲗」是它瞎挑的候选，「㐂」是从 answer 抄的）。
     """
     if isinstance(value, str):
@@ -326,16 +326,16 @@ def _alias_deep(value: Any, aliases: Mapping[str, str]) -> Any:
 
 
 def payload_for(spec: TaskSpec, avoid: Sequence[str] = ()) -> dict[str, Any]:
-    """输入：TaskSpec + 已经用过的题干开头。输出：给模型的事实载荷（单题与批量共用同一份字段）。
+    """输入：TaskSpec + 已经用过的题干开头。输出：给模型的事实提示内容（单题与批量共用同一份字段）。
     预期：只放写这道题**真正需要**的字段——要问什么、素材、答案、候选、依据；
-          空值字段一律不出现在载荷里（小模型的上下文很贵，塞进去只会干扰它）。
+          空值字段一律不出现在提示内容里（小模型的上下文很贵，塞进去只会干扰它）。
           题干里必须原样出现的串（哪个字、哪些候选、位置链、读音）已经写在 instruction 与
-          facts 里，不单列成字段：实测单列之后 2B 会把「必须出现这些串」这条**要求本身**
+          facts 里，不单列成字段：实测单列之后小模型会把「必须出现这些串」这条**要求本身**
           抄进题干。
     """
     aliases = _alias_map(spec)
     payload: dict[str, Any] = {
-        # **不给** `task_id`：实测 2B 会把「T9」原样抄进题干（16y 的 T9 写「请辨识T9编码链
+        # **不给** `task_id`：实测小模型会把「T9」原样抄进题干（16y 的 T9 写「请辨识T9编码链
         # 的最内层部件」）——那是内部编号，对读者毫无意义。
         # 说明是题干的主要来源（候选 / 位置链 / 读音本来就写在说明里），里面的生僻字同样换记号：
         # 模型照抄说明时不该自己去敲生僻字——敲错就是另一道题。
@@ -363,7 +363,7 @@ def build_messages(
     spec: TaskSpec, feedback: Sequence[str] = (), avoid: Sequence[str] = ()
 ) -> list[dict[str, str]]:
     """输入：TaskSpec + 上一轮被拒的原因 + 已用过的开头（都可空）。输出：OpenAI 格式 messages（单题）。
-    预期：示范走 `FEW_SHOT_TURNS` 的真实轮次（角色即输入/输出，不贴标签），真实载荷排在**最后**
+    预期：示范走 `FEW_SHOT_TURNS` 的真实轮次（角色即输入/输出，不贴标签），真实提示内容排在**最后**
           ——离生成最近的那条消息最管用；有 feedback 时再追加一条用户消息把失败原因回灌（reflexion）。
     """
     messages = [
@@ -382,7 +382,7 @@ def build_batch_messages(
 ) -> list[dict[str, str]]:
     """输入：多个 TaskSpec + 按题分组的失败原因（可空）。输出：OpenAI 格式 messages（批量）。
     预期：所有题的事实放进一个 `items` 数组，`id` 从 1 开始（顺序 = 传入顺序）；
-          示范轮次与单题模式同一份，真实载荷仍排在**最后**；批量只改请求打包方式，不改每道题的写法。
+          示范轮次与单题模式同一份，真实提示内容仍排在**最后**；批量只改请求打包方式，不改每道题的写法。
     """
     items: list[dict[str, Any]] = []
     for index, spec in enumerate(specs, start=1):
@@ -417,16 +417,16 @@ def extract_json(text: str) -> dict | None:
 
 
 def payload_of(messages: Sequence[Mapping[str, Any]]) -> dict:
-    """输入：`build_messages` 产出的 messages。输出：其中的事实载荷（含 facts / answer 的那一条）。
+    """输入：`build_messages` 产出的 messages。输出：其中的事实提示内容（含 facts / answer 的那一条）。
     预期：从后往前找第一条能解析成 JSON 对象的 user 消息——重试时会追加反馈消息，
-          所以「载荷永远是 messages[-1]」**不再成立**，回放 / 审计 / 假客户端都要用这个函数取载荷。
+          所以「提示内容永远是 messages[-1]」**不再成立**，回放 / 审计 / 假客户端都要用这个函数取提示内容。
           取不到时返回空字典，不抛异常。
     """
     for message in reversed(list(messages)):
         if message.get("role") != "user":
             continue
         content = str(message.get("content", ""))
-        if content in _FEW_SHOT_BLOBS:  # 示范轮次：形状与真载荷一样，但它不是这一次要写的题
+        if content in _FEW_SHOT_BLOBS:  # 示范轮次：形状与真提示内容一样，但它不是这一次要写的题
             continue
         data = extract_json(content)
         if isinstance(data, dict) and "answer" in data:
@@ -437,7 +437,7 @@ def payload_of(messages: Sequence[Mapping[str, Any]]) -> dict:
 def batch_items_of(messages: Sequence[Mapping[str, Any]]) -> list[dict]:
     """输入：`build_batch_messages` 产出的 messages。输出：`items` 数组（取不到时返回空列表）。
     预期：与 `payload_of` 同源的取法——从后往前找第一条带 `items` 的 user 消息；
-          批量模式没有单题载荷，回放 / 假客户端要用这个函数。
+          批量模式没有单题提示内容，回放 / 假客户端要用这个函数。
     """
     for message in reversed(list(messages)):
         if message.get("role") != "user":
@@ -454,7 +454,7 @@ def _slot_check(
 ) -> Verbalized:
     """输入：模型输出解析出的对象 + 语体/provider/模型 + 可选的题目标签。输出：Verbalized。
     预期：题面与回答缺一不可、必须是非空字符串。单题与批量共用这一份校验——
-          批量路径**不允许**悄悄放宽槽位要求，否则 A/B 就变成「两套标准比质量」。
+          批量路径**不允许**悄悄放宽位置要求，否则 A/B 就变成「两套标准比质量」。
           模型按提示词回的是 `Q` / `A`（`stem` / `explanation` 是产出记录里的叫法），两边都收。
     """
     prefix = f"{label}：" if label else ""
@@ -462,10 +462,10 @@ def _slot_check(
     explanation = data.get("A") or data.get("explanation")
     if not isinstance(stem, str) or not stem.strip():
         return Verbalized(ok=False, provider=provider, model=model,
-                          error=f"{prefix}缺少 Q 槽位（题面）", finish_reason=finish_reason)
+                          error=f"{prefix}缺少 Q 位置（题面）", finish_reason=finish_reason)
     if not isinstance(explanation, str):
         return Verbalized(ok=False, provider=provider, model=model,
-                          error=f"{prefix}缺少 A 槽位（回答）", finish_reason=finish_reason)
+                          error=f"{prefix}缺少 A 位置（回答）", finish_reason=finish_reason)
     return Verbalized(
         ok=True,
         stem=stem.strip(),
@@ -485,7 +485,7 @@ def verbalize(
     avoid: Sequence[str] = (),
 ) -> Verbalized:
     """输入：客户端 + TaskSpec + 温度 + 上一轮失败原因 + 已用过的开头。输出：Verbalized。
-    预期：JSON 解析失败、缺槽位、槽位非字符串一律判失败，绝不半信半疑地放行；
+    预期：JSON 解析失败、缺位置、位置非字符串一律判失败，绝不半信半疑地放行；
           feedback 非空时把它作为额外一轮用户消息传给模型（reflexion）。
     """
     completion = client.complete(build_messages(spec, feedback, avoid), temperature=temperature)
@@ -496,7 +496,7 @@ def verbalize(
     data = extract_json(completion.text)
     if data is None:
         # 把模型**实际吐了什么**带进错误里：光写「不是合法 JSON」对诊断零信息，
-        # 真机上 T10/T16 反复栽在这一句，看不到原文就只能猜（8 条拒收里 5 条是它）。
+        # 真机上 T10/T16 反复栽在这一句，看不到原文就只能猜（8 条没通过里 5 条是它）。
         head = " ".join((completion.text or "").split())[:200]
         return Verbalized(ok=False, provider=completion.provider,
                           model=completion.model, error=f"模型输出不是合法 JSON：{head}")
@@ -516,7 +516,7 @@ def verbalize_batch(
 ) -> list[Verbalized]:
     """输入：客户端 + 多个 TaskSpec + 温度 + 按题分组的失败原因。
     输出：与 `specs` **等长且顺序一致**的 Verbalized 列表。
-    预期：整批一次请求；结果按 `id` 对齐，缺项 / 槽位不合格只让**那一道**失败，不串位。
+    预期：整批一次请求；结果按 `id` 对齐，缺项 / 位置不合格只让**那一道**失败，不串位。
           整批请求失败（网络或整体 JSON 解析失败）时所有题返回同一个 error——
           批量的失败是整批的，不能假装某一道成功。
     """

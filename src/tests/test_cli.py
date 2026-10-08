@@ -106,7 +106,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(backups[0].read_text(encoding="utf-8"), before)
 
     def test_coverage_subcommand_is_read_only(self) -> None:
-        """coverage 子命令只读产出文件，打印池子覆盖情况，不改动任何文件。"""
+        """coverage 子命令只读产出文件，打印字库覆盖情况，不改动任何文件。"""
         out = self.dir / "cov.jsonl"
         with contextlib.redirect_stdout(io.StringIO()):
             main(["dry-run", "--limit", "2", "--data", str(self.data), "--out", str(out)])
@@ -135,7 +135,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("覆盖率未达标", buffer.getvalue())
 
     def test_dedup_subcommand_reports_and_keeps_original(self) -> None:
-        """dedup 只读原产出：报告写旁路文件，--write-kept 另存副本，原文件一个字节不动。"""
+        """dedup 只读原产出：报告写附带文件，--write-kept 另存副本，原文件一个字节不动。"""
         out = self.dir / "d.jsonl"
         rows = [
             {"task_id": "T1", "ziid": "U1", "stem": "请回答下面这道关于汉字的问题：这个「好」字的总笔画数到底是多少呢"},
@@ -198,12 +198,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_audit_filters_产出_and_writes_sidecars(self) -> None:
-        """audit：只留过门禁的记录，剔除写旁路，报告写 .audit.json。"""
-        # 闸门字段必须给全：门禁只发布「可全量复验」的记录（缺字段 = 复验降级 = 不发布）。
+        """audit：只留过门禁的记录，剔除写附带，报告写 .audit.json。"""
+        # 校验字段必须给全：门禁只发布「可全量复验」的记录（缺字段 = 复验降级 = 不发布）。
         gates = {
             "visible_subject": "", "must_contain": [], "hidden_subject": "",
             "stem_asks_any": [], "structure_words": [],
-            # 自然语言那一层的判定：门禁发布时必查（机械闸门只比子串，判不了可读性）
+            # 自然语言那一层的判定：门禁发布时必查（机械校验只比子串，判不了可读性）
             "roundtrip": {"ok": True, "answer": "6", "is_question": True, "error": ""},
         }
         good = {
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     unittest.main()
 
 class ExcludePathsCliTests(unittest.TestCase):
-    """`--exclude` 的参数解析：目录展开一层 jsonl、旁路日志剔掉、路径不存在直接报错。"""
+    """`--exclude` 的参数解析：目录展开一层 jsonl、附带日志剔掉、路径不存在直接报错。"""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -256,7 +256,7 @@ class ExcludePathsCliTests(unittest.TestCase):
         self.dir = Path(self._tmp.name)
 
     def test_directory_expands_and_drops_sidecar_logs(self) -> None:
-        """输入：一个目录。输出：里面的一层 `*.jsonl`，旁路日志（rejects / attempts 等）被剔掉。"""
+        """输入：一个目录。输出：里面的一层 `*.jsonl`，附带日志（rejects / attempts 等）被剔掉。"""
         (self.dir / "a.jsonl").write_text("{}\n", encoding="utf-8")
         (self.dir / "b.jsonl").write_text("{}\n", encoding="utf-8")
         (self.dir / "b.rejects.jsonl").write_text("{}\n", encoding="utf-8")

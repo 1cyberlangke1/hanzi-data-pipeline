@@ -1,8 +1,8 @@
 """本机配置读取（secrets.toml）。
 
-约定（见 findings.md §9.2 / 主人指令）：
+约定：
 - 凭据只存本机 secrets.toml，**不注入环境变量**；换机器手工放同名文件即可。
-- 限额（rpm / batch）是**配置不是常量**：那 12 QPM 只是白山的观测值，换 provider 就改文件。
+- 限额（rpm / batch）是**配置不是常量**：12 QPM 只是某个网关的观测值，换 provider 就改文件。
 - 文件缺失或格式错时报人话，且**绝不回显 api_key**。
 """
 
@@ -32,7 +32,7 @@ class ProviderConfig:
     rpm: int = 0  # 0 = 不限速（仅用于本地 mock）
     batch: int = 1
     # 该 provider 专属的请求体字段，**原样**并进请求 JSON。
-    # 用途：不同提供商的「思考」开关根本不是同一个字段——本地 LM Studio 认 `reasoning_effort`，
+    # 用途：不同提供商的「思考」开关根本不是同一个字段——有的端点认 `reasoning_effort`，
     # 别的端点可能认 `enable_thinking` / `chat_template_kwargs` / `thinking`……所以这里
     # 不做任何字段名适配，只做透传：secrets.toml 里怎么写，请求体里就怎么发。
     # 不配 = 请求体里没有这些字段（端点用模型自己的默认行为）。

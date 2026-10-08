@@ -35,7 +35,7 @@ from .store import JsonlStore
 # 默认输出到 crawler/data/，与爬虫代码放在一起，避免和仓库根目录混在一起。
 DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data"
 
-# 需要访问站点的子命令：这些命令一律先过 robots.txt 闸门。view 只读本地数据，不在此列。
+# 需要访问站点的子命令：这些命令一律先过 robots.txt 校验。view 只读本地数据，不在此列。
 NETWORK_COMMANDS = frozenset({"stats", "enumerate", "chars", "sprites", "verify"})
 
 
@@ -225,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n已中断，已入库的数据不会丢，重跑会自动续爬。", file=sys.stderr)
         return 130
-    except Exception as exc:  # noqa: BLE001 - 顶层兜底，输出人话
+    except Exception as exc:  # noqa: BLE001 - 顶层保底，输出人话
         print(f"抓取失败：{exc}", file=sys.stderr)
         return 1
     finally:

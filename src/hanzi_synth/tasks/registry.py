@@ -1,6 +1,6 @@
 """题型注册表：题型 ID → 构造器，以及「一个字能出哪些题」的统一入口。
 
-题型编号沿用 synthesis/README.md §6.2 的任务族编号：
+题型编号沿用任务族编号：
 T1 字形属性 / T3 IDS 正向 / T4 读音 / T5 字际关系 / T6 文献溯源 /
 T8 约束满足 / T9 部件链多跳 / T10 反例否定 / T11 组合排序 / T12 结构变换 / T13 释义反向造字形 /
 T14 码位 / T15 UTF-8 编码 / T16 码位反查 / T17 释义（答案 = 字典原文切出的义项）。
@@ -77,20 +77,20 @@ CONSTRUCTORS: dict[str, Constructor] = {
 }
 
 
-# 题型 → 该题型**当前**声明的题干闸门（`TaskSpec.stem_asks_any`）。
+# 题型 → 该题型**当前**声明的题干校验（`TaskSpec.stem_asks_any`）。
 #
-# 为什么要有这张表：闸门是**生产时**随记录落盘的，`_offline_record` 写的是当时的
-# `spec.stem_asks_any`。旧构造器压根没声明闸门的题型，其历史记录的该字段是**空元组**
-# ——而 `stem_asks` 那一关在空元组时整条跳过。于是复验（`audit` / 回炉）会拿一个
-# 「没有闸门」的 spec 去查，把「题干问读音、答案是笔画数」这种废题判成 tier A。
+# 为什么要有这张表：校验是**生产时**随记录写入文件的，`_offline_record` 写的是当时的
+# `spec.stem_asks_any`。旧构造器压根没声明校验的题型，其历史记录的该字段是**空元组**
+# ——而 `stem_asks` 那一关在空元组时整条跳过。于是复验（`audit` / 重跑）会拿一个
+# 「没有校验」的 spec 去查，把「题干问读音、答案是笔画数」这种废题判成 tier A。
 # 实测：597 条已发布产出里就有 2 条这样的废题（T1 U0340A / T10 U03400）。
 #
-# 闸门表是**题型级常量**（不随字变），所以能按 task_id 直接补上；`must_contain` /
+# 校验表是**题型级常量**（不随字变），所以能按 task_id 直接补上；`must_contain` /
 # `structure_words` / `hidden_subject` 是**字级**的（T9 的位置路径、T13 的隐藏主语），
 # 补不出来——那三项要靠按 `provenance.rng_seed` 重建 spec 才能复算，不在这张表的范围内。
 #
 # 表与构造器**不许漂移**：`src/tests/test_tasks.py::StemAsksGateCoverageTests` 拿一个
-# 覆盖全部 16 个题型的假字池，逐题型断言「构造器实际挂上的闸门 == 这张表」。
+# 覆盖全部 16 个题型的假字池，逐题型断言「构造器实际挂上的校验 == 这张表」。
 TASK_STEM_ASKS: dict[str, tuple[str, ...]] = {
     "T1_stroke_total": _STROKE_ASK_MARKERS,
     "T3_ids_forward": _IDS_ASK_MARKERS,

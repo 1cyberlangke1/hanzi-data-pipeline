@@ -97,7 +97,7 @@ class CharacterTests(unittest.TestCase):
             api.character("00001")
 
     def test_not_found_error_is_subclass_of_zisea_error(self) -> None:
-        """NotFoundError 必须继承 ZiseaError，方便上层统一兜底。"""
+        """NotFoundError 必须继承 ZiseaError，方便上层统一保底。"""
         self.assertTrue(issubclass(NotFoundError, Exception))
 
 

@@ -4,7 +4,7 @@
     .\.venv\Scripts\python.exe -m hanzi_synth.cli list            # 列出题型
     .\.venv\Scripts\python.exe -m hanzi_synth.cli dry-run         # 只跑 L0/L2，不联网
     .\.venv\Scripts\python.exe -m hanzi_synth.cli run --limit 40  # 端到端小批量
-    .\.venv\Scripts\python.exe -m hanzi_synth.cli reject-stats    # 只读：rejects 按防线汇总
+    .\.venv\Scripts\python.exe -m hanzi_synth.cli reject-stats    # 只读：rejects 按校验规则汇总
     .\.venv\Scripts\python.exe -m hanzi_synth.cli attempt-stats   # 只读：逐轮判定，看首轮死在哪
     .\.venv\Scripts\python.exe -m hanzi_synth.cli render          # 离线程序化渲染，不调模型
     .\.venv\Scripts\python.exe -m hanzi_synth.cli render-stats    # 只读：逐题型量句式数量
@@ -88,20 +88,20 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--overwrite", action="store_true", help="清空重跑（旧产出先备份成 .bak-<时间戳>）")
     run.add_argument("--min-coverage", type=float, default=0.0, help="覆盖率下限，未达标返回退出码 1")
     run.add_argument(
-        "--rejects", default=None, help="L7 回炉：对 rejects 文件里的失败样本单条重试，成功追加进主产出"
+        "--rejects", default=None, help="L7 重跑：对 rejects 文件里的失败样本单条重试，成功追加进主产出"
     )
     run.add_argument(
         "--loop", type=int, default=0,
-        help="L7 自动回炉：主流程跑完后把 rejects 反复回炉，直到没有可回炉的样本（0=关；给的是最多轮数）"
+        help="L7 自动重跑：主流程跑完后把 rejects 反复重跑，直到没有可重跑的样本（0=关；给的是最多轮数）"
              "。每一轮吃上一轮的残留文件，救回的样本直接追加进主产出，一条都不丢"
     )
     run.add_argument(
         "--judge", action="store_true",
-        help="L4.5：程序防线全过后再过一道 LLM 裁判（默认关；README §8.2 要求先做金标标定）",
+        help="L4.5：程序校验规则全过后再过一道 LLM 裁判（默认关；README §8.2 要求先做金标标定）",
     )
     run.add_argument(
         "--roundtrip", action=argparse.BooleanOptionalAction, default=True,
-        help="L4.6 往返检验：把题干与解析交回模型答题，答案对不上载荷里定死的答案就否决重试"
+        help="L4.6 往返检验：把题干与解析交回模型答题，答案对不上提示内容里定死的答案就否决重试"
              "（默认开；--no-roundtrip 关掉）",
     )
     _add_exclude_flag(run)
@@ -114,7 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ren.add_argument(
         "--dropped",
         default=None,
-        help="落选样本（过不了闸门 / 渲染不出）的路径，默认落在 --out 旁边（<out>.dropped.jsonl）",
+        help="落选样本（过不了校验 / 渲染不出）的路径，默认落在 --out 旁边（<out>.dropped.jsonl）",
     )
     ren.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
     ren.add_argument("--seed", type=int, default=20261006)
@@ -124,7 +124,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ren, hops_default=MIXED_LEVEL, constraints_default=MIXED_LEVEL, depth_default=MIXED_DEPTH,
     )
 
-    rs = sub.add_parser("render-stats", help="只读：逐题型穷举句式空间，统计不同题干 / 解析 / 过闸门条数")
+    rs = sub.add_parser("render-stats", help="只读：逐题型穷举句式空间，统计不同题干 / 解析 / 过校验条数")
     rs.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
     rs.add_argument("--tasks", default=None, help="逗号分隔的题型白名单")
     rs.add_argument("--per-type", type=int, default=1, help="每型取样几个字（默认 1）")
@@ -135,12 +135,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=500,
         help="每型**渲染出来的不同题干**下限（含引号/收尾/候选写法），不达标返回退出码 1",
     )
-    cov = sub.add_parser("coverage", help="只读：看现有产出覆盖了池子里的多少字")
+    cov = sub.add_parser("coverage", help="只读：看现有产出覆盖了字库里的多少字")
     cov.add_argument("--out", default=str(DEFAULT_OUT))
     cov.add_argument("--data", default=None, help="chars.jsonl 路径，默认 crawler/data/chars.jsonl")
     cov.add_argument("--pool", type=int, default=0, help="只统计前 N 个字；0 = 全池")
 
-    rej = sub.add_parser("reject-stats", help="只读：按防线名 / 题型汇总 rejects 与 replayed")
+    rej = sub.add_parser("reject-stats", help="只读：按校验规则名 / 题型汇总 rejects 与 replayed")
     rej.add_argument("--rejects", default=str(DEFAULT_OUT.with_suffix(".rejects.jsonl")))
 
     att = sub.add_parser("attempt-stats", help="只读：逐轮 L4 判定汇总（首轮死在哪、救回多少）")
@@ -164,7 +164,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument(
         "--in", dest="inputs", action="append", default=None,
-        help="可重复：产出 jsonl / 目录（目录展开一层 *.jsonl，自动剔掉旁路日志）",
+        help="可重复：产出 jsonl / 目录（目录展开一层 *.jsonl，自动剔掉附带日志）",
     )
     audit.add_argument(
         "--out", default=str(DEFAULT_OUT.with_name("dataset.jsonl")),
@@ -176,7 +176,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument(
         "--unique-by", choices=UNIQUE_MODES, default="none",
-        help="收唯一口径：none = 全收（默认，重复量只报出来）；task-zi = 每道题只留一条",
+        help="收唯一标准：none = 全收（默认，重复量只报出来）；task-zi = 每道题只留一条",
     )
 
     rt = sub.add_parser(
@@ -185,7 +185,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rt.add_argument(
         "--in", dest="inputs", action="append", default=None,
-        help="可重复：产出 jsonl / 目录（目录展开一层 *.jsonl，自动剔掉旁路日志）",
+        help="可重复：产出 jsonl / 目录（目录展开一层 *.jsonl，自动剔掉附带日志）",
     )
     rt.add_argument("--limit", type=int, default=0, help="最多检验多少条；0 = 全检")
     rt.add_argument(
@@ -250,7 +250,7 @@ def _add_difficulty_knobs(
 
 def _add_difficulty_flags(parser: argparse.ArgumentParser) -> None:
     """输入：子命令解析器。输出：无（就地加参数）。
-    预期：`run` 的难度旋钮（同 `_add_difficulty_knobs`）+ 池子规模 / 并发 / 重试。
+    预期：`run` 的难度旋钮（同 `_add_difficulty_knobs`）+ 字库规模 / 并发 / 重试。
     """
     _add_difficulty_knobs(parser)
     parser.add_argument("--pool", type=int, default=0, help="索引只建在前 N 个字上；0 = 全池")
@@ -269,7 +269,7 @@ def _add_difficulty_flags(parser: argparse.ArgumentParser) -> None:
 
 def _exclude_paths(raw: Sequence[str] | None) -> tuple[Path, ...]:
     """输入：CLI 给的 --exclude 路径（文件或目录，可重复）。输出：展开后的文件路径元组。
-    预期：目录展开一层 `*.jsonl` 并剔掉旁路日志（与 `audit` 同一套判据）；
+    预期：目录展开一层 `*.jsonl` 并剔掉附带日志（与 `audit` 同一套判据）；
           不存在的路径直接报错——打错一个字就静默失效，会让人以为已排除。
     """
     if not raw:
@@ -493,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
         stats = run_pipeline(config, progress=lambda msg: print(msg, flush=True))
         loop_rounds = int(getattr(args, "loop", 0) or 0)
         if loop_rounds > 0:
-            # 自动回炉：判失败的样本不是「丢掉」，而是反复回炉直到救回。收敛判据（一轮
+            # 自动重跑：判失败的样本不是「丢掉」，而是反复重跑直到救回。收敛判据（一轮
             # 没救回就刹车、残留文件不嵌套）全在 `auto_replay` 里，那部分有单测盯着。
             stats["auto_loop"] = auto_replay(
                 lambda path: replay_rejects(

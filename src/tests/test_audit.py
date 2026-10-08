@@ -22,7 +22,7 @@ from hanzi_synth.pipeline.audit import (
 
 def make_record(**overrides) -> dict:
     """输入：要覆盖的字段。输出：一条「长得像已发布产出」的最小记录。
-    预期：字段集与 `_record` 落盘的一致（不含 proof/distractors/requirements），
+    预期：字段集与 `_record` 写入文件的一致（不含 proof/distractors/requirements），
           足以让 `spec_from_record` 重建 TaskSpec 并跑完 L4。
     """
     row = {
@@ -33,14 +33,14 @@ def make_record(**overrides) -> dict:
         "answer": "6",
         "accepted": ["6"],
         "options": [],
-        # 闸门字段：旧 schema 的产出记录没有这几个键，复验会静默降级，
+        # 校验字段：旧 schema 的产出记录没有这几个键，复验会静默降级，
         # 所以夹具按**当前** schema 给全，另有用例专门覆盖「缺字段」那条路。
         "visible_subject": "",
         "must_contain": [],
         "hidden_subject": "",
         "stem_asks_any": [],
         "structure_words": [],
-        # 自然语言那一层的判定（往返检验）：机械闸门只比子串，判不了可读性，
+        # 自然语言那一层的判定（往返检验）：机械校验只比子串，判不了可读性，
         # 所以记录必须自己带上这一份，发布门禁也据此判。
         "roundtrip": {"ok": True, "answer": "6", "is_question": True, "error": ""},
         "stem": "这个字「好」一共有几画？",
@@ -59,7 +59,7 @@ def write_rows(path: Path, rows: list[dict]) -> Path:
 
 
 class AuditRecordTests(unittest.TestCase):
-    """`audit_record`：一条记录的判定口径必须与主流程完全一致。"""
+    """`audit_record`：一条记录的判定标准必须与主流程完全一致。"""
 
     def test_clean_record_is_kept(self) -> None:
         """干净记录：判 A，且一条失败原因都没有。"""
@@ -72,7 +72,7 @@ class AuditRecordTests(unittest.TestCase):
         """记录里写着「子串比对没过、但 LLM 仲裁判过」→ 门禁认这份结论，不重判成失败。
 
         预期：解析用中文数字说出答案（「六画」而不是 `6`）时子串比对必然判不出，主流程靠 LLM
-              仲裁放行；门禁只重跑机械闸门，若不认这份记录，同一条数据就会「主流程发布、
+              仲裁放行；门禁只重跑机械校验，若不认这份记录，同一条数据就会「主流程发布、
               门禁剔掉」——实测 93 条被剔记录里 62 条正是这一类。
         """
         row = make_record(
@@ -98,9 +98,9 @@ class AuditRecordTests(unittest.TestCase):
         self.assertFalse(audit_record(unmarked)["keep"])
 
     def test_dropped_row_carries_a_replay_payload(self) -> None:
-        """旁路行必须带得动回炉：`spec` 能重建 TaskSpec，`cli replay` 直接吃。
+        """附带行必须带得动重跑：`spec` 能重建 TaskSpec，`cli replay` 直接吃。
 
-        预期：「不进数据集」不等于「可以丢」。只留 task_id / ziid / 原因的话，回炉还得人工回源
+        预期：「不进数据集」不等于「可以丢」。只留 task_id / ziid / 原因的话，重跑还得人工回源
               文件里找那条记录——那就是事实上的丢弃。
         """
         row = make_record(
@@ -138,7 +138,7 @@ class AuditRecordTests(unittest.TestCase):
         self.assertTrue(any("㐀" in f for f in outcome["failures"]))
 
     def test_judge_veto_blocks_publication(self) -> None:
-        """程序全过但裁判否决 → 不许发布（与 `_publishable` 同口径）。"""
+        """程序全过但裁判否决 → 不许发布（与 `_publishable` 同标准）。"""
         row = make_record(judge={"ok": False, "reason": "不自足"})
         outcome = audit_record(row)
         self.assertEqual(outcome["tier"], "A")
@@ -147,7 +147,7 @@ class AuditRecordTests(unittest.TestCase):
     def test_roundtrip_veto_blocks_publication(self) -> None:
         """程序全过、裁判没开，但往返检验否决（读者答不出定死的答案）→ 不许发布。
 
-        机械闸门只会做子串 / 集合比对，「这段话读者读得懂吗」不在它的能力范围里；
+        机械校验只会做子串 / 集合比对，「这段话读者读得懂吗」不在它的能力范围里；
         那一层只有往返检验能判，所以它的否决必须与裁判否决同等对待。
         """
         row = make_record(
@@ -161,7 +161,7 @@ class AuditRecordTests(unittest.TestCase):
         """往返检验**缺席**（请求挂了 / 输出坏了）不算否决、也不算通过：不许发布。
 
         缺席是「这条检验没跑成」，不是对文本的判决，所以理由单列「读者缺席」桶；
-        但没被读过的记录同样不能进数据集（与 `_publishable` 同口径）——它进旁路等重新合成。
+        但没被读过的记录同样不能进数据集（与 `_publishable` 同标准）——它进附带等重新合成。
         """
         row = make_record(roundtrip={"ok": False, "error": "往返检验请求失败"})
         outcome = audit_record(row)
@@ -170,7 +170,7 @@ class AuditRecordTests(unittest.TestCase):
         self.assertTrue(any("读者缺席" in f for f in outcome["failures"]), outcome["failures"])
 
     def test_offline_template_record_needs_no_roundtrip(self) -> None:
-        """离线模板产出：机械闸门字段齐全、没有 `roundtrip`，照样算查得全、可以发布。
+        """离线模板产出：机械校验字段齐全、没有 `roundtrip`，照样算查得全、可以发布。
 
         预期：往返检验的对象是**模型写的那段自然语言**；离线产出的自然语言是程序按句式池
               拼的，检验对象不存在。把它判成「查得不严」会让 705,175 条离线数据一条都进不了
@@ -191,7 +191,7 @@ class AuditRecordTests(unittest.TestCase):
         self.assertIn("roundtrip", _missing_gates(row))
 
     def test_offline_template_still_needs_mechanical_gates(self) -> None:
-        """豁免的只是 `roundtrip`：离线记录缺机械闸门字段照样算 partial、不发布。"""
+        """豁免的只是 `roundtrip`：离线记录缺机械校验字段照样算 partial、不发布。"""
         row = make_record(provenance={"mode": "offline-template"})
         del row["roundtrip"]
         del row["stem_asks_any"]
@@ -228,7 +228,7 @@ class SourceCollectionTests(unittest.TestCase):
         self.dir = Path(self._tmp.name)
 
     def test_sidecars_are_not_sources(self) -> None:
-        """旁路日志 / 回炉副本 / 去重副本都不是产出源。"""
+        """附带日志 / 重跑副本 / 去重副本都不是产出源。"""
         for name in (
             "batch.jsonl",
             "batch.attempts.jsonl",
@@ -243,7 +243,7 @@ class SourceCollectionTests(unittest.TestCase):
             self.assertEqual(is_published_source(Path(name)), expected, name)
 
     def test_directory_expansion_skips_sidecars(self) -> None:
-        """给目录：展开一层 *.jsonl，旁路文件自动剔掉。"""
+        """给目录：展开一层 *.jsonl，附带文件自动剔掉。"""
         write_rows(self.dir / "a.jsonl", [make_record()])
         write_rows(self.dir / "a.rejects.jsonl", [make_record()])
         write_rows(self.dir / "a.attempts.jsonl", [make_record()])
@@ -280,7 +280,7 @@ class AuditSourcesTests(unittest.TestCase):
         self.dir = Path(self._tmp.name)
 
     def test_keeps_passers_and_reports_reasons(self) -> None:
-        """能过的留下、过不去的进旁路，失败原因按防线名汇总。"""
+        """能过的留下、过不去的进附带，失败原因按校验规则名汇总。"""
         good = make_record()
         bad = make_record(
             ziid="U03400",
@@ -331,7 +331,7 @@ class AuditSourcesTests(unittest.TestCase):
         self.assertEqual(report["already_assembled_by_source"], {"dataset.jsonl": 1})
 
     def test_offline_payloads_are_not_records(self) -> None:
-        """`dry-run` 的离线载荷（没有 stem/explanation）单独计数，不算失败记录。"""
+        """`dry-run` 的离线提示内容（没有 stem/explanation）单独计数，不算失败记录。"""
         payload = {"task_id": "T_test", "ziid": "U0597D", "instruction": "i", "facts": {"zi": "好"}, "answer": "6"}
         self.assertFalse(is_published_record(payload))
         path = write_rows(self.dir / "dry.jsonl", [payload, make_record()])
@@ -342,7 +342,7 @@ class AuditSourcesTests(unittest.TestCase):
         self.assertEqual(report["total_records"], 1)
 
     def test_unknown_unique_mode_raises(self) -> None:
-        """收唯一口径写错当场报错，不静默按默认跑。"""
+        """收唯一标准写错当场报错，不静默按默认跑。"""
         with self.assertRaises(ValueError):
             audit_sources([], unique_by="whatever")
 
@@ -362,7 +362,7 @@ class DatasetRowTests(unittest.TestCase):
         self.dir = Path(self._tmp.name)
 
     def test_verification_is_recomputed(self) -> None:
-        """源记录里那份 `verification` 是旧代码的结论，落盘时按本行文本重算。"""
+        """源记录里那份 `verification` 是旧代码的结论，写入文件时按本行文本重算。"""
         row = make_record(verification={"tier": "C", "failures": ["旧的结论"]})
         path = write_rows(self.dir / "a.jsonl", [row])
         kept, _, _ = audit_sources([path])
@@ -371,11 +371,11 @@ class DatasetRowTests(unittest.TestCase):
         self.assertEqual(kept[0]["audit"], {"source": "a.jsonl", "recheck": "full"})
 
     def test_old_schema_record_is_not_published(self) -> None:
-        """旧 schema（缺闸门字段）**不发布**：降级复验对「这条合不合格」没有证明力。
+        """旧 schema（缺校验字段）**不发布**：降级复验对「这条合不合格」没有证明力。
 
         实测旧格式记录里躺着「这个字是什么？」这种读者无从作答的废题——缺 `visible_subject`
         时「题干有没有写出那个字」这条判据整条空转，降级复验照样判 A。查得没那么严 ≠ 查过了，
-        所以这类记录进旁路文件、原因记 `unverifiable`（当前管线重新合成即可）。
+        所以这类记录进附带文件、原因记 `unverifiable`（当前管线重新合成即可）。
         """
         row = make_record()
         for field in ("facts", "visible_subject", "must_contain", "hidden_subject", "stem_asks_any", "structure_words"):
@@ -385,7 +385,7 @@ class DatasetRowTests(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0]["tier"], "unverifiable")
-        self.assertIn("缺闸门字段", dropped[0]["failures"][0])
+        self.assertIn("缺校验字段", dropped[0]["failures"][0])
         self.assertEqual(report["recheck_partial"], 1)
         self.assertEqual(report["recheck_partial_dropped"], 1)
         self.assertEqual(report["recheck_partial_by_source"], {"old.jsonl": 1})
@@ -393,7 +393,7 @@ class DatasetRowTests(unittest.TestCase):
     def test_record_without_llm_verdict_is_not_published(self) -> None:
         """记录里没有往返检验的判定（跑的时候关了 / 旧 schema）→ 不发布。
 
-        只留机械防线的结论，数据集对「这段话读得通」就没有证据；而「没查」不能当「查过了」。
+        只留机械校验规则的结论，数据集对「这段话读得通」就没有证据；而「没查」不能当「查过了」。
         """
         row = make_record(roundtrip=None)
         path = write_rows(self.dir / "no_llm.jsonl", [row])

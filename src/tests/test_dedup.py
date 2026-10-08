@@ -101,7 +101,7 @@ class DedupIndexTests(unittest.TestCase):
 
 class LoadJsonlTests(unittest.TestCase):
     def test_missing_file_is_empty_not_fatal(self) -> None:
-        """文件不存在返回空，旁路工具不该因为缺文件崩掉。"""
+        """文件不存在返回空，附带工具不该因为缺文件崩掉。"""
         with tempfile.TemporaryDirectory() as tmp:
             rows, skipped = load_jsonl(Path(tmp) / "nope.jsonl")
             self.assertEqual((rows, skipped), ([], 0))
@@ -211,7 +211,7 @@ class DedupFileTests(unittest.TestCase):
             self.assertEqual(kept, [])
 
     def test_write_report_and_kept(self) -> None:
-        """旁路文件写在 <out>.dedup.json / <out>.dedup.jsonl，原文件不动。"""
+        """附带文件写在 <out>.dedup.json / <out>.dedup.jsonl，原文件不动。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "out.jsonl"
             write_rows(path, [{"task_id": "T1", "ziid": "U1", "stem": LONG_A}])

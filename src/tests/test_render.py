@@ -1,4 +1,4 @@
-"""离线程序化渲染的测试：模板池覆盖、句式空间下限、确定性与闸门。
+"""离线程序化渲染的测试：模板池覆盖、句式空间下限、确定性与校验。
 
 输入：`tests.support.full_coverage_pool()` 造的假字池（不读磁盘）。
 输出：断言。
@@ -118,8 +118,8 @@ class ClausePlaceholderTests(unittest.TestCase):
     _OK_BEFORE = frozenset("：，？→ 足合知备是果道据若再\n") | {""}
 
     def _clause_sites(self):
-        """输入：无。输出：[(题型, 骨架, 槽位, 前一个字符, 后一个字符)]。
-        预期：只扫两个从句槽位——`{subject}` / `{options}` 装的是名词，两侧接字面词是正常的。
+        """输入：无。输出：[(题型, 骨架, 位置, 前一个字符, 后一个字符)]。
+        预期：只扫两个从句位置——`{subject}` / `{options}` 装的是名词，两侧接字面词是正常的。
         """
         for task_id, cores in O._CORES.items():
             for core in cores:
@@ -135,7 +135,7 @@ class ClausePlaceholderTests(unittest.TestCase):
                         start = pos + 1
 
     def test_clause_placeholders_are_delimited(self) -> None:
-        """从句槽位两侧不许粘字面词：粘上就是「画这些条件」那类残片。"""
+        """从句位置两侧不许粘字面词：粘上就是「画这些条件」那类残片。"""
         offenders = [
             f"{task_id} :: {core}（{slot} 前 {head!r} 后 {tail!r}）"
             for task_id, core, slot, head, tail in self._clause_sites()
@@ -149,7 +149,7 @@ class TemplatePoolTests(unittest.TestCase):
 
     def test_every_registered_type_has_templates(self) -> None:
         """题型在 `CONSTRUCTORS` 里注册了，模板池就必须有它的骨架与解析——缺一个就渲染不出题。
-        例外只有释义类题：它们按 AGENTS.md §六 走 LLM 路径，模板池里**故意**没有它们。
+        例外只有释义类题：它们走 LLM 路径，模板池里**故意**没有它们。
         """
         for task_id in CONSTRUCTORS:
             if task_id in O.LLM_ONLY_TASK_IDS:
@@ -233,7 +233,7 @@ class TemplatePoolTests(unittest.TestCase):
                 self.assertEqual(O.render(spec, variant), O.render(spec, variant), task_id)
 
     def test_rendered_stems_hit_the_task_marker(self) -> None:
-        """渲染出来的题干必须命中题型声明的判据词，否则 `stem_asks` 整条闸门形同虚设。"""
+        """渲染出来的题干必须命中题型声明的判据词，否则 `stem_asks` 整条校验形同虚设。"""
         for task_id, spec in _offline_specs().items():
             markers = spec.stem_asks_any
             self.assertTrue(markers, f"{task_id} 没声明 stem_asks_any")
@@ -248,7 +248,7 @@ class TemplatePoolTests(unittest.TestCase):
             self.assertGreater(hits, 0, f"{task_id} 一个变体都渲染不出来")
 
     def test_rendered_text_carries_no_internal_term(self) -> None:
-        """产出必须上下文无关：渲染出来的句子里不许出现程序侧的说法（题干 / 载荷 / facts 一类）。"""
+        """产出必须上下文无关：渲染出来的句子里不许出现程序侧的说法（题干 / 提示内容 / facts 一类）。"""
         for task_id, spec in _offline_specs().items():
             for variant in _sample_variants(O.variant_space(spec)):
                 rendered = O.render(spec, variant)
@@ -275,9 +275,9 @@ class TemplatePoolTests(unittest.TestCase):
 class EmptyPlaceholderTests(unittest.TestCase):
     """模板**用到的**占位符取到空串时，`render` 必须判 None，不许拼出缺成分的句子。
 
-    输入：假字池里的一条真 spec，用 `dataclasses.replace` 把某个槽位改成空值。输出：断言。
+    输入：假字池里的一条真 spec，用 `dataclasses.replace` 把某个位置改成空值。输出：断言。
     预期：这是「字海内部编号记录（写不出字形）」那批记录在渲染层的护栏。数据侧已经由 loader
-          的准入闸门挡住，这里钉的是渲染器自己的不变式——将来换数据源、加题型，只要哪个槽位空了，
+          的准入校验挡住，这里钉的是渲染器自己的不变式——将来换数据源、加题型，只要哪个位置空了，
           句子就渲染不出来（由 `generate` 计入 `unrenderable` 并写进落选文件），不会漏进数据集。
     """
 
@@ -319,16 +319,16 @@ class EmptyPlaceholderTests(unittest.TestCase):
 
 
 class LeakRuleParityTests(unittest.TestCase):
-    """渲染器与闸门必须共用同一条「答案在题干里能出现几次」判据。
+    """渲染器与校验必须共用同一条「答案在题干里能出现几次」判据。
 
     输入：假字池里每型一条 spec。输出：断言。
-    预期：两处算法分叉过一次——闸门按 1/0 次判废，渲染器不看这条，于是渲染完直接被拒；
+    预期：两处算法分叉过一次——校验按 1/0 次判废，渲染器不看这条，于是渲染完直接被拒；
           全量实测 38 条 (题型, 字) 因此一条数据都出不来（其中 32 条换一条不撞答案的句式就能出，
-          `synthesis/out/probe_leak_rescue.py`）。这条把「渲染器只会挑过得了闸门的句式」钉死。
+          `synthesis/out/probe_leak_rescue.py`）。这条把「渲染器只会挑过得了校验的句式」钉死。
     """
 
     def test_render_never_exceeds_the_gate_limit(self) -> None:
-        """渲染出来的每一句都必须满足闸门的答案出现次数上限。"""
+        """渲染出来的每一句都必须满足校验的答案出现次数上限。"""
         for task_id, spec in _offline_specs().items():
             for variant in _sample_variants(O.stem_space(spec)):
                 rendered = O.render(spec, variant)
@@ -342,7 +342,7 @@ class LeakRuleParityTests(unittest.TestCase):
                     self.assertLessEqual(
                         stem_norm.count(needle),
                         answer_leak_limit(spec, item),
-                        f"{task_id} 渲染出的题干超过了闸门允许的答案出现次数：{rendered[0]}",
+                        f"{task_id} 渲染出的题干超过了校验允许的答案出现次数：{rendered[0]}",
                     )
 
     def test_colliding_choice_answer_switches_wording(self) -> None:
@@ -389,7 +389,7 @@ class ExplanationVarietyTests(unittest.TestCase):
             explanations = {explanation for _stem, explanation in rendered}
             self.assertGreaterEqual(
                 len(explanations), len(bodies),
-                f"{task_id} 只渲染出 {len(explanations)} 种解析，池子里有 {len(bodies)} 条",
+                f"{task_id} 只渲染出 {len(explanations)} 种解析，字库里有 {len(bodies)} 条",
             )
 
     def test_explanation_is_part_of_the_variant_space(self) -> None:
@@ -404,10 +404,10 @@ class ExplanationVarietyTests(unittest.TestCase):
 class RenderIndependenceTests(unittest.TestCase):
     """输入：假字池（把 loader 换掉，不读磁盘）。输出：断言。
 
-    预期：钉住「各题型的随机源互不干扰」——同一 (题型, 字) 的产出不许因为池子里多一型、少一型而变。
+    预期：钉住「各题型的随机源互不干扰」——同一 (题型, 字) 的产出不许因为字库里多一型、少一型而变。
           实测过反面（`synthesis/out/_probe_coupling_a/b.jsonl`）：`generate` 原先用**一个**跨
           (字, 题型) 共享的 random.Random，删掉 T1 之后 T10 的候选 0/343 相同、T11 0/240、T16 0/354
-          ——数据集的内容取决于「当时池子里有哪几型」，那份落盘数据就不再是当前代码能复现的了。
+          ——数据集的内容取决于「当时字库里有哪几型」，那份写入文件数据就不再是当前代码能复现的了。
     """
 
     def _render(self, pool, task_ids, out_dir: Path) -> dict:
@@ -439,10 +439,10 @@ class RenderIndependenceTests(unittest.TestCase):
         self.assertEqual(differing[:3], [], f"{len(differing)} 条产出的内容被别的题型挪动了")
 
     def test_dropped_rows_are_kept_with_a_reason(self) -> None:
-        """过不了闸门的产出不许静默消失：整条写进 `<out>.dropped.jsonl`，带 `drop_reason` 与 `failures`。
+        """过不了校验的产出不许静默消失：整条写进 `<out>.dropped.jsonl`，带 `drop_reason` 与 `failures`。
 
         预期：主数据集要干净（过不了的不进去），但落选样本必须能被翻出来查——「没进主数据集」
-              和「丢了」是两件事。主人对回炉那条纪律是同一个要求（rejects 不许丢）。
+              和「丢了」是两件事。主人对重跑那条纪律是同一个要求（rejects 不许丢）。
         """
         pool = full_coverage_pool()
         out_dir = Path(tempfile.mkdtemp())
@@ -454,8 +454,8 @@ class RenderIndependenceTests(unittest.TestCase):
         ), mock.patch("hanzi_synth.render.generate.verify", lambda *_args, **_kwargs: failing):
             stats = generate(limit=100000, out_path=out, progress=lambda _msg: None)
 
-        self.assertEqual(stats["written"], 0, "闸门全判失败时不该有任何一条进主数据集")
-        self.assertGreater(stats["unverified"], 0, "假池一条都没过闸门，这条测试白测")
+        self.assertEqual(stats["written"], 0, "校验全判失败时不该有任何一条进主数据集")
+        self.assertGreater(stats["unverified"], 0, "假池一条都没过校验，这条测试白测")
         dropped = [
             json.loads(line)
             for line in out.with_suffix(".dropped.jsonl").read_text(encoding="utf-8").splitlines()
@@ -522,7 +522,7 @@ class AxesTests(unittest.TestCase):
                 )
                 got = O.render(spec, variant)
                 if got is None:
-                    # 唯一的 None 来源是泄题：答案落在题干里。用与闸门同一判据复核，
+                    # 唯一的 None 来源是泄题：答案落在题干里。用与校验同一判据复核，
                     # 不许拿「跳过」把「axes 拆出来的句子其实渲染不出来」盖过去。
                     stem_norm = normalize_for_match(expected[0])
                     leaked = [
@@ -548,13 +548,13 @@ class CensusTests(unittest.TestCase):
     """输入：假字池。输出：断言。预期：census 穷举整段句式空间并数出去重后的题干数。"""
 
     def test_census_counts_distinct_stems_and_verifies_them(self) -> None:
-        """一条题的 census：不同题干数 ≤ 空间大小，且过闸门的题干是它的子集、不为空。"""
+        """一条题的 census：不同题干数 ≤ 空间大小，且过校验的题干是它的子集、不为空。"""
         specs = _one_spec_per_type()
         spec = specs["T1_stroke_total"]
         found = census(spec)
         self.assertEqual(found.space, O.variant_space(spec))
         self.assertGreater(len(found.stems), 1)
-        self.assertTrue(found.verified, "一条都过不了闸门，模板池就是坏的")
+        self.assertTrue(found.verified, "一条都过不了校验，模板池就是坏的")
         self.assertTrue(found.verified <= found.stems)
         self.assertTrue(found.explanations)
         # 三层句式数各报各的：问法骨架 ≤ 骨架×收尾 ≤ 真的渲染出来的题干 ≤ 整段空间。

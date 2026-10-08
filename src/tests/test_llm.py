@@ -146,7 +146,7 @@ class VerbalizeTests(unittest.TestCase):
         self.assertEqual(result.finish_reason, "length")
 
     def test_missing_slot_fails(self) -> None:
-        """缺槽位判失败，不半信半疑放行。"""
+        """缺位置判失败，不半信半疑放行。"""
         client = FakeClient([ok_completion('{"stem": "\u53ea\u6709\u9898\u5e72"}')])
         self.assertFalse(verbalize(client, self.spec).ok)
 
@@ -163,10 +163,10 @@ class VerbalizeTests(unittest.TestCase):
         self.assertNotIn("api_key", messages[1]["content"])
 
     def test_payload_keeps_only_what_the_model_needs(self) -> None:
-        """载荷只放写这道题真正需要的字段，空值字段一律不出现。
+        """提示内容只放写这道题真正需要的字段，空值字段一律不出现。
 
         预期：最朴素的一道题（有 instruction / facts / answer、没有候选也没有隐藏主语）
-              就这几个键——小模型的上下文很贵，塞进去的空槽位只会干扰它。
+              就这几个键——小模型的上下文很贵，塞进去的空位置只会干扰它。
         """
         spec = TaskSpec(task_id="T14_unicode_codepoint", instruction="i",
                         facts={"zi": "\u3400"}, answer="U+3400", visible_subject="\u3400")
@@ -174,9 +174,9 @@ class VerbalizeTests(unittest.TestCase):
         self.assertEqual(set(payload), {"instruction", "facts", "answer"})
 
     def test_payload_sends_only_declared_facts(self) -> None:
-        """载荷 facts 只发 `spec.payload_facts` 声明的键。
+        """提示内容 facts 只发 `spec.payload_facts` 声明的键。
 
-        预期：构造器的 `facts` 是给闸门 / 离线渲染用的**全集**（判分要读它、模板要读它），
+        预期：构造器的 `facts` 是给校验 / 离线渲染用的**全集**（判分要读它、模板要读它），
               措辞模型只需要「写这道题要引用的那几个值」。不裁剪时模型会拿别的题的材料当素材
               ——实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，产出写成
               「给出码位 E3 90 8B，让读者从下列选项中选出对应的字」。
@@ -192,16 +192,16 @@ class VerbalizeTests(unittest.TestCase):
         """没声明 `payload_facts` 的 spec（手工构造的、老测试用的）保持原行为：facts 全发。
 
         预期：注册题型一律显式声明，这条兜的是 `payload_facts` 默认值那条路——默认值不能是
-              「什么都不发」，否则手工构造的 spec 会静默变成空载荷。
+              「什么都不发」，否则手工构造的 spec 会静默变成空提示内容。
         """
         spec = TaskSpec(task_id="T_test", instruction="i", facts={"alpha": 1, "beta": 2}, answer="1")
         payload = payload_of(build_messages(spec))
         self.assertEqual(set(payload["facts"]), {"alpha", "beta"})
 
     def test_payload_drops_facts_already_given_at_top_level(self) -> None:
-        """载荷不重复顶层已经给过的信息：facts 里的 options / nswer_zi 同值就去掉。
+        """提示内容不重复顶层已经给过的信息：facts 里的 options / nswer_zi 同值就去掉。
 
-        预期：顶层 options 是**占位符化**过的那一份；facts 里再留一份原始生僻字，2B 会照那份写
+        预期：顶层 options 是**占位符化**过的那一份；facts 里再留一份原始生僻字，小模型会照那份写
               题干，绕开回填。只在**同值**时去掉——facts 里那份不一样就留着，不替模型猜。
         """
         spec = TaskSpec(task_id="T11_stroke_extreme", instruction="i",
@@ -210,7 +210,7 @@ class VerbalizeTests(unittest.TestCase):
                         answer="\u3400", options=("\u3400", "\u597d"))
         payload = payload_of(build_messages(spec))
         self.assertEqual(set(payload["facts"]), {"strokes"})
-        # 整份载荷同一套记号：答案也是记号，回填后才是真字。
+        # 整份提示内容同一套记号：答案也是记号，回填后才是真字。
         from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
 
         aliases = _alias_map(spec)
@@ -222,7 +222,7 @@ class VerbalizeTests(unittest.TestCase):
                        facts={"options": ["\u3400"], "answer_zi": "\u597d"},
                        answer="\u3400", options=("\u3400", "\u597d"))
         kept = payload_of(build_messages(odd))
-        # 载荷里的生僻字一律是记号，比对前先回填。
+        # 提示内容里的生僻字一律是记号，比对前先回填。
         from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
 
         odd_aliases = _alias_map(odd)
@@ -232,7 +232,7 @@ class VerbalizeTests(unittest.TestCase):
         self.assertEqual(_restore_aliases(kept["facts"]["answer_zi"], odd_aliases), "\u597d")
 
     def test_choice_options_reach_the_model(self) -> None:
-        """选择题的候选必须原样进载荷的 `options`：模型看不到候选就会写出
+        """选择题的候选必须原样进提示内容的 `options`：模型看不到候选就会写出
         「下面是一些有趣的汉字。请问总笔画数最少的是哪一个？」这种一个候选都没列的废题
         （实测 16b 的 T11 就是这样）。"""
         spec = TaskSpec(task_id="T11_stroke_extreme", instruction="i",
@@ -264,9 +264,9 @@ class VerbalizeTests(unittest.TestCase):
         self.assertEqual(_restore_aliases(payload["instruction"], _alias_map(spec)), spec.instruction)
 
     def test_instruction_keeps_the_subject_verbatim(self) -> None:
-        """整份载荷（说明 / 候选 / 答案 / facts）用**同一套记号**，回填后与 TaskSpec 逐字段一致。
+        """整份提示内容（说明 / 候选 / 答案 / facts）用**同一套记号**，回填后与 TaskSpec 逐字段一致。
 
-        预期：只给候选取记号、facts 里留真字时，2B 无从对照，会写出自相矛盾的解析
+        预期：只给候选取记号、facts 里留真字时，小模型无从对照，会写出自相矛盾的解析
               （实测 T11 产出「笔画最少的是𡲗，对应字是㐂」——「𡲗」是它瞎挑的候选，
               「㐂」是从 answer 抄的）。同一套记号它才分得清哪个是答案。
         """
@@ -288,7 +288,7 @@ class VerbalizeTests(unittest.TestCase):
         """模型把记号写松了（`[[4] ]` / `[[ 4 ]]`）也要能回填成真字。
 
         预期：实测（`probe_noinstr.jsonl` 的 T10 U03402）产出里多了一个空格，占位符就原样落进
-              题干、被闸门判 tier C 打回——那条数据本来是对的，白扔一次重试。记号之外的方括号
+              题干、被校验判 tier C 打回——那条数据本来是对的，白扔一次重试。记号之外的方括号
               一律不动，免得把正文里的普通方括号吃掉。
         """
         from hanzi_synth.llm.verbalizer import _alias_map, _restore_aliases
@@ -301,7 +301,7 @@ class VerbalizeTests(unittest.TestCase):
         self.assertEqual(_restore_aliases("[1] 与 [[x]]", aliases), "[1] 与 [[x]]")
 
     def test_feedback_is_appended_as_an_extra_user_turn(self) -> None:
-        """reflexion：反馈是**追加**的一条 user 消息，载荷本身不被改写。"""
+        """reflexion：反馈是**追加**的一条 user 消息，提示内容本身不被改写。"""
         plain = build_messages(self.spec)
         retried = build_messages(self.spec, ("answer_in_explanation: \u89e3\u6790\u91cc\u6ca1\u6709\u51fa\u73b0\u7b54\u6848",))
         self.assertEqual(len(retried), len(plain) + 1)
@@ -324,7 +324,7 @@ class BatchTests(unittest.TestCase):
         ]
 
     def test_items_are_numbered_from_one(self) -> None:
-        """批量载荷把 N 道题放进 items，id 从 1 开始且顺序 = 传入顺序。"""
+        """批量提示内容把 N 道题放进 items，id 从 1 开始且顺序 = 传入顺序。"""
         items = batch_items_of(build_batch_messages(self.specs))
         self.assertEqual([item["id"] for item in items], [1, 2, 3])
         self.assertEqual([item["answer"] for item in items], ["1", "2", "3"])
@@ -352,7 +352,7 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(all(not item.ok and item.error == "HTTP 500" for item in out))
 
     def test_batch_slot_check_is_as_strict_as_single(self) -> None:
-        """批量路径不许放宽槽位要求，否则 A/B 就变成两套标准比质量。"""
+        """批量路径不许放宽位置要求，否则 A/B 就变成两套标准比质量。"""
         text = json.dumps({"results": [
             {"id": 1, "stem": "\u4e00", "explanation": "\u4e00"},
             {"id": 2, "stem": "   ", "explanation": "\u4e8c"},
@@ -370,7 +370,7 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(all("results" in (item.error or "") for item in out))
 
     def test_payload_and_items_lookup_return_empty_when_absent(self) -> None:
-        """取不到载荷就返回空（{} / []），不抛异常——回放工具不该因为一条消息格式怪就崩。"""
+        """取不到提示内容就返回空（{} / []），不抛异常——回放工具不该因为一条消息格式怪就崩。"""
         single = build_messages(self.specs[0])
         self.assertEqual(batch_items_of(single), [])
         self.assertEqual(payload_of(build_batch_messages(self.specs)), {})
@@ -421,7 +421,7 @@ class ChatClientTests(unittest.TestCase):
         self.assertEqual(result.attempts, 2)
 
     def test_transient_4xx_is_retried(self) -> None:
-        """引擎侧瞬态故障被报成 4xx 时也要重试：实测 LM Studio 在并发下回 HTTP 400
+        """引擎侧瞬态故障被报成 4xx 时也要重试：实测本地推理引擎在并发下回 HTTP 400
         「Context size has been exceeded」，而同一份 payload 单独重发立刻成功。"""
         provider = ProviderConfig(name="p1", base_url="http://p1.test/v1", model="m", api_key="k", rpm=0)
         body = '{"error":"Engine protocol predict stream returned an error: '
@@ -475,7 +475,7 @@ class ChatClientTests(unittest.TestCase):
 
         预期：没配 = 请求体里没有它（不认这个字段的端点不会因为未知字段吃 400）；
               配了 = 字段名与取值**原样**带上，代码不做任何适配（各家的思考开关名字不一样）。
-              实测本地 LM Studio 靠 `reasoning_effort = "none"` 把往返检验从 325 秒压到 0.6 秒。
+              实测在本地端点上用 `reasoning_effort = "none"` 关掉思考，往返检验从 325 秒压到 0.6 秒。
         """
         plain = ProviderConfig(name="p1", base_url="http://p1.test/v1", model="m", api_key="k", rpm=0)
         capped = ProviderConfig(name="p2", base_url="http://p2.test/v1", model="m", api_key="k", rpm=0,
@@ -505,7 +505,7 @@ class JudgeTests(unittest.TestCase):
 
     def _spec(self):
         """输入：无。输出：一个带内部字段的 TaskSpec。预期：facts 必须存在，
-        这样才能验证它真的没进裁判载荷。
+        这样才能验证它真的没进裁判提示内容。
         """
         from hanzi_synth.tasks.base import TaskSpec
 
@@ -593,8 +593,8 @@ class JudgeTests(unittest.TestCase):
             self.assertNotIn(text, SYSTEM_PROMPT)
 
     def test_judgement_dict_keeps_the_judging_model(self) -> None:
-        """落盘的判定必须带 provider / model：换了裁判模型 κ 就是另一个数，
-        不记下来分不清是「裁判改了口径」还是「数据真的变好了」。
+        """写入文件的判定必须带 provider / model：换了裁判模型 κ 就是另一个数，
+        不记下来分不清是「裁判改了标准」还是「数据真的变好了」。
         """
         from hanzi_synth.llm.judge import judge_record
 
@@ -605,14 +605,14 @@ class JudgeTests(unittest.TestCase):
 
 
 class PromptInvariantTests(unittest.TestCase):
-    """输入：无。输出：断言。预期：提示词与载荷里不出现内部编号——模型会把它们抄进题干。"""
+    """输入：无。输出：断言。预期：提示词与提示内容里不出现内部编号——模型会把它们抄进题干。"""
 
     def test_no_task_code_reaches_the_model(self) -> None:
         """内部题型代号（T9 / T13）绝不能出现在**模型可见**的任何文本里。
 
         实测 16y 的 T9 题干写「请辨识T9编码链的最内层部件。」——「T9」是从提示词里漏出来的
-        内部编号，对读者毫无意义。载荷里的 `task` 字段已删除，系统提示词里的代号也一并改掉；
-        这条测试盯着两处入口：系统提示词、裁判提示词，以及**全部构造器产出的载荷字符串**。
+        内部编号，对读者毫无意义。提示内容里的 `task` 字段已删除，系统提示词里的代号也一并改掉；
+        这条测试盯着两处入口：系统提示词、裁判提示词，以及**全部构造器产出的提示内容字符串**。
         """
         import json
         import random
@@ -624,7 +624,7 @@ class PromptInvariantTests(unittest.TestCase):
         from hanzi_synth.tasks.registry import build_all
         from tests.support import make_character, make_index
 
-        # 题型代号形如 T1 / T13：出现在模型可见文本里就说明内部编号漏进了载荷。
+        # 题型代号形如 T1 / T13：出现在模型可见文本里就说明内部编号漏进了提示内容。
         _TASK_CODE_RE = re.compile(r"\bT\d{1,2}\b")
 
         for label, text in (("SYSTEM_PROMPT", SYSTEM_PROMPT), ("JUDGE_SYSTEM_PROMPT", JUDGE_SYSTEM_PROMPT)):
@@ -646,7 +646,7 @@ class PromptInvariantTests(unittest.TestCase):
             for character in characters
             for spec in build_all(character, rng=random.Random(7), index=index, difficulty=Difficulty())
         ]
-        self.assertGreaterEqual(len(specs), 8, "夹具至少要出得来 8 道题，否则这条闸门形同虚设")
+        self.assertGreaterEqual(len(specs), 8, "夹具至少要出得来 8 道题，否则这条校验形同虚设")
         for spec in specs:
             blob = json.dumps(
                 {
@@ -658,12 +658,12 @@ class PromptInvariantTests(unittest.TestCase):
                 ensure_ascii=False,
             )
             hit = _TASK_CODE_RE.search(blob)
-            self.assertIsNone(hit, f"{spec.task_id} 的载荷里出现题型代号 {hit and hit.group(0)!r}")
+            self.assertIsNone(hit, f"{spec.task_id} 的提示内容里出现题型代号 {hit and hit.group(0)!r}")
 
     def test_writer_prompt_shows_no_copyable_internal_word(self) -> None:
         """措辞提示词里不许出现 `_INTERNAL_TERMS` 里的**中文**词。
 
-        实测：提示词里写「题干」，2B 就写「题干中提到了「上边」」；写「请在提供的汉字中找出」，
+        实测：提示词里写「题干」，小模型就写「题干中提到了「上边」」；写「请在提供的汉字中找出」，
         它就原样抄进产出。产出必须上下文无关，所以提示词一律用**键名**（stem / explanation）
         指代产出，一个可抄的中文样本都不给。ASCII 字段名（facts / instruction）必须留着——
         模型要读它们，而且它们出现在中文散文里会被 `no_field_names` / `no_internal_terms` 挡下。
@@ -672,7 +672,7 @@ class PromptInvariantTests(unittest.TestCase):
         from hanzi_synth.verify.checks import _INTERNAL_TERMS
 
         chinese_terms = [term for term in _INTERNAL_TERMS if not term.isascii()]
-        self.assertTrue(chinese_terms, "内部词表里应当有中文词，否则这条闸门形同虚设")
+        self.assertTrue(chinese_terms, "内部词表里应当有中文词，否则这条校验形同虚设")
         for term in chinese_terms:
             for label, text in (
                 ("SYSTEM_PROMPT", SYSTEM_PROMPT), ("BATCH_SUFFIX", BATCH_SUFFIX),
@@ -683,13 +683,13 @@ class PromptInvariantTests(unittest.TestCase):
     def test_demo_turns_are_not_mistaken_for_the_real_payload(self) -> None:
         """示范轮次里也有一份形状相同的输入 JSON：`payload_of` 必须跳过它。
 
-        预期：单题取到的是**这一次**的载荷；批量模式没有单题载荷，仍返回空字典。
+        预期：单题取到的是**这一次**的提示内容；批量模式没有单题提示内容，仍返回空字典。
         """
         spec = TaskSpec(task_id="T_test", instruction="i", facts={"zi": "好"}, answer="6")
         messages = build_messages(spec)
         self.assertGreater(len(messages), 3, "示范轮次应当真的进了 messages")
         # 角色序列由**示范条数**推出来（示范不少于两条是实测下限：砍成一条时 A 会写成光秃答案）。
-        # 缺了这条断言，消息被拼坏（system 重复、示范粘在同一行、载荷排到示范前面）时全量单测照样全绿。
+        # 缺了这条断言，消息被拼坏（system 重复、示范粘在同一行、提示内容排到示范前面）时全量单测照样全绿。
         from hanzi_synth.llm.verbalizer import FEW_SHOT_TURNS
 
         self.assertGreaterEqual(len(FEW_SHOT_TURNS), 2, "示范条数不能低于实测下限两条")
@@ -707,13 +707,13 @@ class PromptInvariantTests(unittest.TestCase):
         spec = TaskSpec(task_id="T_test", instruction="i", facts={}, answer="a")
         payload = payload_for(spec, ("请问", "下面"))
         self.assertEqual(payload["avoid_openings"], ["请问", "下面"])
-        # 没有已用过的开头时这个键根本不出现——空槽位不进模型的上下文。
+        # 没有已用过的开头时这个键根本不出现——空位置不进模型的上下文。
         self.assertNotIn("avoid_openings", payload_for(spec))
 
     def test_arbiter_prompt_separates_writing_style_from_values(self) -> None:
         """仲裁提示必须写清「只差分隔符 / 大小写才是等价，值不同就是不等价」。
 
-        实测 2B 把 `E2 82 AC` 判成与 `E3 90 89` 等价（理由是「分隔符和大小写不同」）——
+        实测小模型把 `E2 82 AC` 判成与 `E3 90 89` 等价（理由是「分隔符和大小写不同」）——
         仲裁太松的另一面：会把错的答案留在数据里。所以提示里要有正反两个例子，并要求拿不准判 false。
         """
         self.assertIn("E3 90 89", _EQUIV_SYSTEM_PROMPT)
@@ -722,7 +722,7 @@ class PromptInvariantTests(unittest.TestCase):
 
 
 class RoundTripTests(unittest.TestCase):
-    """输入：各种模型回复。输出：往返检验的判定。预期：只认「答出的答案里含载荷里定死的答案」。"""
+    """输入：各种模型回复。输出：往返检验的判定。预期：只认「答出的答案里含提示内容里定死的答案」。"""
 
     @staticmethod
     def _spec():
@@ -762,7 +762,7 @@ class RoundTripTests(unittest.TestCase):
         return _V()
 
     def test_payload_never_carries_the_answer(self) -> None:
-        """载荷里绝不能有答案：放了答案这道检验就自证了。"""
+        """提示内容里绝不能有答案：放了答案这道检验就自证了。"""
         messages = build_roundtrip_messages(self._verbalized(), self._spec())
         blob = json.dumps(messages, ensure_ascii=False)
         self.assertIn("「㐑」是什么", blob)
@@ -778,7 +778,7 @@ class RoundTripTests(unittest.TestCase):
             self.assertTrue(answer_matches(self._spec(), text), text)
 
     def test_alias_is_accepted(self) -> None:
-        """载荷里 `accepted` 是同一件事的合法写法，逐个试。"""
+        """提示内容里 `accepted` 是同一件事的合法写法，逐个试。"""
         self.assertTrue(answer_matches(self._spec(), "E3 90 91"))
 
     def test_machine_values_match_after_separator_and_case_normalisation(self) -> None:
@@ -817,7 +817,7 @@ class RoundTripTests(unittest.TestCase):
     def test_writer_instructions_in_stem_are_vetoed(self) -> None:
         """题干里夹着写给写作者的要求（读者不该看到）→ 否决，即使答案答对了。
 
-        这一条只有读自然语言才判得了：机械闸门只会做子串 / 集合比对，
+        这一条只有读自然语言才判得了：机械校验只会做子串 / 集合比对，
         分不出「请列出所有候选」是题目的一部分还是写作要求。
         """
         result = roundtrip_answer(
@@ -833,7 +833,7 @@ class RoundTripTests(unittest.TestCase):
         """解析里夹带写给写题人的话（自证 / 推托）→ 否决。
 
         实测漏网原句：「证明这个分解方式是正确的」「具体含义需根据上下文判断」——题干干净、
-        答案也在解析里，机械闸门一条都拦不住；这只有把解析读一遍才判得了。
+        答案也在解析里，机械校验一条都拦不住；这只有把解析读一遍才判得了。
         """
         client = self._client('{"answer": "㐑"}', '{"phrases": ["证明这个分解方式是正确的"]}')
         result = roundtrip_answer(client, self._spec(), self._verbalized())
@@ -856,7 +856,7 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(client.calls, 1)
 
     def test_writing_scan_payload_has_no_answer(self) -> None:
-        """措辞检验的载荷只有题干与解析，没有答案——给了答案它就会拿答案当尺子。"""
+        """措辞检验的提示内容只有题干与解析，没有答案——给了答案它就会拿答案当尺子。"""
         messages = build_writing_messages(self._verbalized())
         self.assertEqual(set(json.loads(messages[1]["content"])), {"stem", "explanation"})
 
@@ -929,7 +929,7 @@ class RoundTripTests(unittest.TestCase):
         self.assertFalse(reader_answer_ok(spec, "㐒"))
 
     def test_verdict_records_every_judgement(self) -> None:
-        """落盘的判定里必须带全部判据：事后审计要能看出「这题当时被判过什么」。"""
+        """写入文件的判定里必须带全部判据：事后审计要能看出「这题当时被判过什么」。"""
         result = roundtrip_answer(
             self._client('{"answer": "㐑", "is_question": false, "identifies_subject": true, "writer_phrases": []}'),
             self._spec(),
@@ -1016,7 +1016,7 @@ class AnswerArbitrationTests(unittest.TestCase):
     def test_machine_value_needs_a_comparable_reading_from_the_arbiter(self) -> None:
         """机器值也送仲裁，但仲裁必须**解析出可比对的写法**——给不出来按缺席处理，退回快速通道。
 
-        实测 2B 判「写法不同」会把 `E4 B1 91` 说成与 `E3 90 89` 等价（理由「只是分隔符和大小写
+        实测小模型判「写法不同」会把 `E4 B1 91` 说成与 `E3 90 89` 等价（理由「只是分隔符和大小写
         不同」），所以机器值的逐位比对由程序做：仲裁只负责把读者写的自然语言照抄成标准答案的
         写法（`reader_value`），且那个写法必须在**读者原话里找得到**——挡「把标准答案抄一遍」。
         夹具只给 `equivalent`、不给 `reader_value`，正是「解析不出来」的那种输出。
@@ -1052,7 +1052,7 @@ class AnswerArbitrationTests(unittest.TestCase):
     def test_a_guessed_answer_does_not_block_publication(self) -> None:
         """读者凭空编一个题干里没有的值 → 不否决，并把原因留在记录里。
 
-        汉字题一大类是知识题（几画 / 读音 / 码位 / 第几页），2B 读者没有那些知识，编一个值
+        汉字题一大类是知识题（几画 / 读音 / 码位 / 第几页），小模型读者没有那些知识，编一个值
         出来是常态（实测 T14「码位是多少」被编出 `E1A0`）；否决它等于把好题丢掉。
         """
         # 第二个正文是仲裁的回复（不是 JSON = 仲裁缺席），第三个才是措辞检验的「没意见」。
@@ -1136,7 +1136,7 @@ class ExplanationStatesAnswerTests(unittest.TestCase):
 
     @staticmethod
     def _verbalized(explanation: str = "「㐑」读作 xié。"):
-        """输入：解析。输出：L3 产出替身。预期：语义核验只读 explanation 与载荷里的答案。"""
+        """输入：解析。输出：L3 产出替身。预期：语义核验只读 explanation 与提示内容里的答案。"""
 
         class _V:
             stem = "「㐑」的读音是什么？"
@@ -1172,16 +1172,16 @@ class ExplanationStatesAnswerTests(unittest.TestCase):
         self.assertTrue(error)
 
     def test_payload_carries_no_internal_fields(self) -> None:
-        """载荷里只放解析与答案，不放 instruction / facts 这些内部字段。"""
+        """提示内容里只放解析与答案，不放 instruction / facts 这些内部字段。"""
         messages = build_states_answer_messages(self._spec(), self._verbalized())
         body = json.loads(messages[1]["content"])
         self.assertEqual(set(body), {"explanation", "answer", "accepted"})
 
 
 class SubjectCorroborationTests(unittest.TestCase):
-    """输入：读者自报「缺条件」+ 机械闸门的旁证。输出：判定。
+    """输入：读者自报「缺条件」+ 机械校验的旁证。输出：判定。
 
-    预期：「题干没说清问哪个字」这条否决要有**旁证**才算数——机械闸门确认题面里识别串一个
+    预期：「题干没说清问哪个字」这条否决要有**旁证**才算数——机械校验确认题面里识别串一个
           不缺（`subject_in_stem` / `options_listed` 都过）时，读者还自报缺条件就是误报
           （实测 T13 反向题 / T8 约束题两条好题因此被丢进 rejects）。拿不到旁证（老记录）时
           按老规矩否决——旁证只用来推翻误报，不用来放行。
@@ -1224,7 +1224,7 @@ class SubjectCorroborationTests(unittest.TestCase):
         return _V()
 
     def test_gates_confirm_identification_from_a_dict(self) -> None:
-        """落盘记录里的 `verification` 字典：两条闸门都过 = 有旁证。"""
+        """写入文件记录里的 `verification` 字典：两条校验都过 = 有旁证。"""
         self.assertTrue(subject_identified_by_gates({"subject_in_stem": True, "options_listed": True}))
 
     def test_gates_report_a_failed_gate(self) -> None:

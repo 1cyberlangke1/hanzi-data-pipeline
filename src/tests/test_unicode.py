@@ -119,7 +119,7 @@ class CodepointTaskTests(unittest.TestCase):
     def test_payload_codepoint_forms_are_self_identifying_only(self) -> None:
         """发给模型的 `codepoint_forms` 只能是**自明**的码点写法：带 `U+` 前缀的十六进制、十进制。
 
-        预期：两条排除理由——① UTF-8 字节序列不是码位，混进去时 2B 会写「给出码位 E3 90 8B」
+        预期：两条排除理由——① UTF-8 字节序列不是码位，混进去时小模型会写「给出码位 E3 90 8B」
               （主人点名过）；② 裸十六进制（`4E00`）与十进制（`19968`）在文本里长得一样，
               混进去时产出会写成「码位 4E00」——同一个词时而指十六进制时而指十进制，
               实测 T14 有 15,085 条解析、T16 有 45,157 条题干是这么写的。

@@ -1,6 +1,6 @@
 """抓取完整性核对：证明「站点收录的每一个 ZIID 都已入库」。
 
-对账口径全部取自站点权威接口：
+对账标准全部取自站点权威接口：
   /api/stats   -> 全站总数、各系列总数、有 IDS 的字数
   /api/groups  -> 各系列下每个前缀桶的收录数
 本地侧只读产出文件：chars.jsonl / chars_index.jsonl / sprites/。
@@ -70,7 +70,7 @@ class DetailScan:
 def prefix_lengths(groups: dict) -> dict[str, int]:
     """输入：/api/groups 返回。输出：{系列字母: 前缀长度}。
     预期：同一系列内前缀长度一致（实测 U 组 3 位、Z/P 组 2 位）；不一致时抛
-          ValueError —— 逐前缀对账口径失效时必须报错，而不是给出错误的「全绿」。
+          ValueError —— 逐前缀对账标准失效时必须报错，而不是给出错误的「全绿」。
     """
     lengths: dict[str, int] = {}
     for series in groups.get("series") or []:
@@ -82,7 +82,7 @@ def prefix_lengths(groups: dict) -> dict[str, int]:
             current = lengths.setdefault(letter, len(prefix))
             if current != len(prefix):
                 raise ValueError(
-                    f"系列 {letter} 的前缀长度不一致（{current} vs {len(prefix)}），逐前缀对账口径失效"
+                    f"系列 {letter} 的前缀长度不一致（{current} vs {len(prefix)}），逐前缀对账标准失效"
                 )
     return lengths
 

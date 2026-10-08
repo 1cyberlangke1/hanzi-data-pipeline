@@ -35,14 +35,14 @@ class LoaderTests(unittest.TestCase):
         self.path = Path(self._tmp.name) / "chars.jsonl"
 
     def test_keeps_records_with_usable_ids(self) -> None:
-        """有合法 IDS 的字进池，多候选原样保留。"""
+        """有合法 IDS 的字进字库，多候选原样保留。"""
         write_jsonl(self.path, [make_record("U03406", "\u3406", "\u2ff0\u5973\u5b50(G),\u2ff1\u597d\u4e00(H)")])
         records = load_characters(self.path)
         self.assertEqual(len(records), 1)
         self.assertEqual(len(records[0].ids_candidates), 2)
 
     def test_skips_records_without_ids(self) -> None:
-        """没有 ids 字段、或只有笔画记法的字，一律不进池。"""
+        """没有 ids 字段、或只有笔画记法的字，一律不进字库。"""
         write_jsonl(self.path, [
             make_record("Z00001", "", None),
             make_record("U04E00", "\u4e00", "#(H)(G),{\u4e00}#(T)(t)"),
@@ -52,7 +52,7 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual([r.ziid for r in records], ["U0597D"])
 
     def test_skips_records_without_a_writable_glyph(self) -> None:
-        """没有字形（`zi` 为空）的记录不进池：这种记录一条题都出不了。
+        """没有字形（`zi` 为空）的记录不进字库：这种记录一条题都出不了。
 
         预期：字海内部编号记录（ziid 形如 `Z31607`，无 Unicode 码位）常常有完整 IDS，但**写不出
               这个字本身**，而任何一道题都得先把它写出来才能问。放进来只会渲染出「从出发，取上边

@@ -1,10 +1,10 @@
 """离线渲染出题：不调任何模型，直接按句式池把 TaskSpec 渲染成数据。
 
 输入：字数上限、题型白名单、输出路径、种子。
-输出：落盘 JSONL + 统计 dict。
+输出：写入文件 JSONL + 统计 dict。
 预期：句式是程序自己写死的模板，措辞正确性由模板本身保证；但「模板是程序写的」不等于「一定对」，
-      所以每条仍然逐条过同一套机械闸门（`verify`），过不了的**不落盘**并计入 `unverified`——
-      落盘的每一条都带 `verification` 自证。
+      所以每条仍然逐条过同一套机械校验（`verify`），过不了的**不写入文件**并计入 `unverified`——
+      写入文件的每一条都带 `verification` 自证。
       事实与答案只有 TaskSpec 一个来源，所以答案不可能被措辞写错。
       唯一需要换句式的情况：非选择题的答案恰好出现在题干里（泄题），见 `_render_one`。
 """
@@ -41,10 +41,10 @@ def _start_variant(seed: int, task_id: str, ziid: str, space: int) -> int:
 
 def spec_rng(seed: int, task_id: str, ziid: str) -> random.Random:
     """输入：种子 + 题型 + 字标识。输出：这一 (题型, 字) **专属**的随机源。
-    预期：随机源只由自己的键决定，与「池子里有哪几型」「前面的字抽了几次」全都无关。
+    预期：随机源只由自己的键决定，与「字库里有哪几型」「前面的字抽了几次」全都无关。
           原先用的是一个跨 (字, 题型) 共享的 `random.Random`，于是删掉一型就把后面每一型的
           随机流整体挪位——实测删掉 T1 之后 T10 的候选 0/343 相同、T11 0/240、T16 0/354
-          （`synthesis/out/probe_coupling_before.txt`），落盘数据的内容取决于当时池子里有哪几型，
+          （`synthesis/out/probe_coupling_before.txt`），写入文件数据的内容取决于当时字库里有哪几型，
           换一次题型清单就复现不出同一份数据集。`random.Random(str)` 内部走 sha512，
           跨进程、跨平台稳定（不受 PYTHONHASHSEED 影响）。
     """
@@ -53,7 +53,7 @@ def spec_rng(seed: int, task_id: str, ziid: str) -> random.Random:
 
 def _render_one(spec, seed: int) -> tuple[str, str, int] | None:
     """输入：TaskSpec + 种子。输出：(stem, explanation, variant)，渲染不出时 None。
-    预期：模板是程序自己写的，不过任何闸门；从 `_start_variant` 起步环形找一个能渲染的
+    预期：模板是程序自己写的，不过任何校验；从 `_start_variant` 起步环形找一个能渲染的
           句式。`render` 只对一种变体返回 None——非选择题的答案恰好落在题干里（泄题），
           这时顺着环形换下一个句式，不是「校验失败」。
           走位按**题干空间**封顶：泄题与否只由题干决定，一段解析里的题干全试过了还没得挑，
@@ -95,10 +95,10 @@ def generate(
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """输入：上限 + 输出路径 + 落选文件路径 + 数据路径 + 题型白名单 + 种子 + 每型下限 + 难度。输出：统计 dict。
-    预期：逐字逐题型构造 TaskSpec → 渲染 → 过闸门 → 落盘；同一 (题型, 字) 只出一条。
+    预期：逐字逐题型构造 TaskSpec → 渲染 → 过校验 → 写入文件；同一 (题型, 字) 只出一条。
           达不到 `min_per_type` 时如实报告，不假装完成。
-          **过不了闸门 / 渲染不出来的那几条一条都不丢**：写进 `<out>.dropped.jsonl`，带 `drop_reason`
-          与闸门给出的 `failures`（默认落在 `out_path` 旁边，可用 `dropped_path` 改）。
+          **过不了校验 / 渲染不出来的那几条一条都不丢**：写进 `<out>.dropped.jsonl`，带 `drop_reason`
+          与校验给出的 `failures`（默认落在 `out_path` 旁边，可用 `dropped_path` 改）。
           「不落进主数据集」与「丢了」是两件事——主数据集要干净，落选的样本要能被人翻出来查。
           出题一律走 `registry.build_all`（唯一入口）——难度阶梯与 `resolved_*` 落定只写在一处。
     """
@@ -172,8 +172,8 @@ def generate(
                     )
                     continue
                 stem, explanation, variant = rendered
-                # 「模板是程序写的」不等于「一定对」：逐条过同一套机械闸门。
-                # 过不了不进主数据集（如实计入 unverified，并整条写进落选文件）；落盘的每一条都带
+                # 「模板是程序写的」不等于「一定对」：逐条过同一套机械校验。
+                # 过不了不进主数据集（如实计入 unverified，并整条写进落选文件）；写入文件的每一条都带
                 # verification 自证。
                 verification = verify(spec, Verbalized(ok=True, stem=stem, explanation=explanation))
                 if verification.tier != "A":
@@ -220,8 +220,8 @@ def _record(
     *,
     drop_reason: str = "",
 ) -> dict[str, Any]:
-    """输入：一条 spec + 字记录 + 种子 + 难度 + 句式序号 + 产出文本 + 闸门结果 + 落选原因。
-    输出：一条待落盘的记录（主数据集与落选文件**同一个形状**）。
+    """输入：一条 spec + 字记录 + 种子 + 难度 + 句式序号 + 产出文本 + 校验结果 + 落选原因。
+    输出：一条待写入文件的记录（主数据集与落选文件**同一个形状**）。
     预期：两处共用这一个构造器，落选样本才带得齐「它本来要写成什么样、为什么没过」；
           `drop_reason` 空串表示这是进主数据集的正式产出，非空表示它落选了。
     """

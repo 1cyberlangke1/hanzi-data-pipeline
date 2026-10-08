@@ -1,4 +1,4 @@
-"""合成池索引的单元测试。"""
+"""合成字库索引的单元测试。"""
 
 from __future__ import annotations
 

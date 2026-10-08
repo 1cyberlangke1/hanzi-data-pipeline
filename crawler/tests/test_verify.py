@@ -88,7 +88,7 @@ class PrefixLengthTests(unittest.TestCase):
         self.assertEqual(prefix_lengths(GROUPS), {"U": 3, "Z": 2})
 
     def test_inconsistent_length_raises(self) -> None:
-        """同系列前缀长度不一致说明对账口径失效，必须抛错而不是给出错误的「全绿」。"""
+        """同系列前缀长度不一致说明对账标准失效，必须抛错而不是给出错误的「全绿」。"""
         broken = {"series": [{"series": "U", "groups": [{"prefix": "U04", "count": 1}, {"prefix": "U0", "count": 1}]}]}
         with self.assertRaises(ValueError):
             prefix_lengths(broken)

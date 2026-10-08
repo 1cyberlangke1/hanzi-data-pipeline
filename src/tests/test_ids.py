@@ -29,7 +29,7 @@ class ParseCandidatesTests(unittest.TestCase):
         """片假名只是叶典的记号，不是合法部件——含它的候选整条判非法。
 
         真实例子：`丑` 的三个候选（`⿼ユ十` / `⿻⿼ユ丨一` / `⿻⿼コ丨一`）全部含片假名，
-        所以这个字在严格口径下没有可用 IDS。
+        所以这个字在严格标准下没有可用 IDS。
         """
         self.assertEqual(parse_candidates("\u2ffc\u30e6\u5341"), ())
         self.assertEqual(parse_candidates("\u2ffc\u30e6\u5341(G),\u2ffb\u2ffc\u30e6\u4e28\u4e00(H)"), ())

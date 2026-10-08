@@ -76,9 +76,9 @@ class IdsForwardTests(unittest.TestCase):
     def test_stem_must_ask_for_the_component_structure(self) -> None:
         """题干问的必须是「结构拆解」那件事：T3 漏过「问这个字一共有几画」这种换了问题的产出。
 
-        说明与闸门里都不出现 `IDS`：那是英文缩写，2B 会连英文夹注一起抄进中文题干
+        说明与校验里都不出现 `IDS`：那是英文缩写，小模型会连英文夹注一起抄进中文题干
         （实测产出「请说明字符㐀的 IDS（ideographic description sequence）分解方式」）。
-        闸门只认中文说法，说明也就用中文说法去描述要问什么。
+        校验只认中文说法，说明也就用中文说法去描述要问什么。
         """
         character = make_character()
         spec = build_ids_forward(character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character]))
@@ -140,16 +140,16 @@ class IdsReverseTests(unittest.TestCase):
             character, rng=random.Random(1), difficulty=Difficulty(), index=make_index([character])
         )
         assert spec is not None
-        # facts 只给**展示写法**（带调符号）：给了 ascii 那份 2B 会挑它抄。
+        # facts 只给**展示写法**（带调符号）：给了 ascii 那份小模型会挑它抄。
         self.assertEqual(spec.facts["reading_display"], ["hǎo"])
-        # 识别条件是**程序侧闸门**（`must_contain`），不是散文要求：只写「靠读音认出」模型照样漏。
+        # 识别条件是**程序侧校验**（`must_contain`），不是散文要求：只写「靠读音认出」模型照样漏。
         self.assertEqual(spec.must_contain, tuple(spec.facts["reading_display"]))
         # 说明里必须**带上读音本身**：真机 2/18 栽在「题干没写读音」，而只写「靠读音认出」时
         # 模型不写具体读音；写进说明后读音 3/3、释义 3/3（probe_t13.jsonl）。
         self.assertIn("hǎo", spec.instruction)
 
     def test_declares_structure_words_and_forbids_them_in_stem(self) -> None:
-        """T13 必须声明答案真实用到的位置词，并要求题干里一个都不出现——实测 2B 用
+        """T13 必须声明答案真实用到的位置词，并要求题干里一个都不出现——实测小模型用
         「字形结构属于左上包围」把答案那棵树用散文说了一遍，读者照抄就能得分。
         """
         character = make_character(
@@ -176,8 +176,8 @@ class IdsReverseTests(unittest.TestCase):
         )
         assert spec is not None
         # 不许照抄释义原文（含互见条目）、不许出现 IDS、不许写出这个字本身——三条都由
-        # 程序侧闸门兜（`no_source_copy` / `no_answer_leak` / `hidden_subject`），
-        # 说明里不写禁令句（写了会被 2B 翻译进题干）。
+        # 程序侧校验兜（`no_source_copy` / `no_answer_leak` / `hidden_subject`），
+        # 说明里不写禁令句（写了会被小模型翻译进题干）。
         self.assertEqual(spec.hidden_subject, character.zi)
         self.assertNotIn("\u540c\u3010", spec.instruction)
 
@@ -198,7 +198,7 @@ class IdsReverseTests(unittest.TestCase):
 
     def test_cross_references_are_stripped_before_wording(self) -> None:
         """释义里的互见条目必须在构造时删掉：它会把答案那个字直接写出来
-        （实测 2B 把「同『依』」原样抄进题干）。删掉靠字符串处理，不靠求模型别抄。
+        （实测小模型把「同『依』」原样抄进题干）。删掉靠字符串处理，不靠求模型别抄。
         """
         character = make_character(
             meanings={
@@ -318,12 +318,12 @@ class ReadingTests(unittest.TestCase):
     def test_instruction_only_says_what_to_ask(self) -> None:
         """T4 的出题说明只说「问什么」，一条写作要求 / 禁令都不写。
 
-        实测：说明里写「列出所有候选」「请用自己的话解释…保留…」时，2B 会把这些句子**翻译**
+        实测：说明里写「列出所有候选」「请用自己的话解释…保留…」时，小模型会把这些句子**翻译**
         进中文题干（`--limit 8` 探针里 T11/T13 的题干就是说明的要求句），数据于是不再是自然语言。
-        所以要求句一律不进说明：禁令由程序侧闸门（`no_answer_leak` 等）兜，
+        所以要求句一律不进说明：禁令由程序侧校验（`no_answer_leak` 等）兜，
         「题干里有没有夹要求」由 L4.6 往返检验判（那是 LLM 的事）。
 
-        说明的**句式**也有实测约束：写成完整问句（「「好」怎么读」）时 2B 会整句照抄（12 次里
+        说明的**句式**也有实测约束：写成完整问句（「「好」怎么读」）时小模型会整句照抄（12 次里
         9 次），数据里就是程序回声；写成名词性短语（「「好」的读音」）后照抄归零，12/12 都落成
         了问句（探针 v10）。
         """
@@ -339,7 +339,7 @@ class GlossPhraseTests(unittest.TestCase):
     """`facts.gloss.gloss_phrase`：T13 的识别条件用它，所以它必须**只吐纯中文义项**。
 
     预期：与 T17 的 `gloss_items` 共用同一套清洗（`_items_of_block`），字典排版残片一个都进不来；
-          义项之间用顿号连成**名词性短语**（出现句读就成了完整句子，2B 会整句照抄进题干）。
+          义项之间用顿号连成**名词性短语**（出现句读就成了完整句子，小模型会整句照抄进题干）。
     """
 
     def test_senses_join_into_one_phrase(self) -> None:
@@ -354,8 +354,8 @@ class GlossPhraseTests(unittest.TestCase):
     def test_long_single_sense_is_refused(self) -> None:
         """单条义项超过上限（默认 9 字）时返回空串——这种字不出反向题。
 
-        预期：闸门 `no_source_copy` 数的是**连续汉字**，顿号会断开计数，所以每条义项 ≤9 字时
-              题干照实写也不会被判照抄；整句超过 9 字时 2B 改写不了、只能反复回炉
+        预期：校验 `no_source_copy` 数的是**连续汉字**，顿号会断开计数，所以每条义项 ≤9 字时
+              题干照实写也不会被判照抄；整句超过 9 字时小模型改写不了、只能反复重跑
               （实测短语 ≥10 字的 T13 被拒率 94%、<10 字的 32%）。
         """
         long_sense = "体型较小，背部青灰色，腹部黄褐色，嘴长而尖，脚短爪硬，善攀援树木"
@@ -378,9 +378,9 @@ class GlossPhraseTests(unittest.TestCase):
 class InstructionCarriesGateStringsTests(unittest.TestCase):
     """说明必须带上「题干必须原样出现的串」：候选 / 位置链 / 读音。
 
-    实测（本地 2B，温度 0.6）：这些串只放在 facts 里 2B 不捞——四个选择题型候选列全 0/8、
+    实测（本地小模型，温度 0.6）：这些串只放在 facts 里小模型不捞——四个选择题型候选列全 0/8、
     tier A 0/8；写进说明后 8/8 列全、tier A 11/12（probe_weave.jsonl）；T13 的读音 3/3、
-    释义 3/3（probe_t13.jsonl）。说明里缺了这些串，闸门就只能靠回炉，白烧配额。
+    释义 3/3（probe_t13.jsonl）。说明里缺了这些串，校验就只能靠重跑，白烧配额。
     """
 
     def _specs(self) -> list:
@@ -480,7 +480,7 @@ class DifficultyTests(unittest.TestCase):
         """每个题型都必须给出**一句中文的「要问什么」**，不带程序口吻。
 
         预期：说明是一个**名词性短语**（「「㐀」的总笔画数」）——不带「问读者」这类口吻、
-              不带句读、不带写作要求。带了口吻（实测「问读者：…」）或写成完整问句时，2B 会
+              不带句读、不带写作要求。带了口吻（实测「问读者：…」）或写成完整问句时，小模型会
               把它原样抄进产出，数据集里就出现程序回声（探针 v9–v11：照抄 9/12 → 0/12）。
         """
         character = make_character(
@@ -503,7 +503,7 @@ class DifficultyTests(unittest.TestCase):
             for mark in ("\u3002", "\uff1b", "\uff1a", "\uff01", "\uff1f", "!", "?", "."):
                 self.assertNotIn(mark, instruction, f"{task_id} 的出题说明里出现句读 {mark!r}")
             # 说明只说「问什么」：多出来的那几句（「List every candidate」这类写作要求）会被
-            # 2B 翻译成中文题干里的要求句，产出就不再是自然语言。
+            # 小模型翻译成中文题干里的要求句，产出就不再是自然语言。
             for mouth in ("\u95ee\u8bfb\u8005", "\u8bfb\u8005", "\u9898\u5e72", "\u9898\u76ee", "\u51fa\u9898"):
                 self.assertNotIn(mouth, instruction, f"{task_id} 的出题说明带了程序口吻 {mouth!r}")
         self.assertGreater(checked, 0)
@@ -680,7 +680,7 @@ class IdsTransformChainTests(unittest.TestCase):
 
 class PerTaskStructuralInvariantTests(unittest.TestCase):
     """输入：全池前 200 个字的构造结果。输出：断言。预期：每个题型各自的**结构性判据**成立，
-    而不是「L4 那 11 条通用防线过了」就算对：facts 必须与源数据一致、answer 必须是 facts 的直接值、
+    而不是「L4 那 11 条通用校验规则过了」就算对：facts 必须与源数据一致、answer 必须是 facts 的直接值、
     唯一性 / 链式必须真成立（T8 唯一解、T9 路径可达、T10 唯一反例、T11 唯一极值、T12 链自洽）。
     """
 
@@ -851,14 +851,14 @@ class PerTaskStructuralInvariantTests(unittest.TestCase):
 
 class ChoiceTaskRequirementTests(unittest.TestCase):
     """输入：真实字表（`chars.jsonl`）。输出：断言。
-    预期：凡是声明了 `options` 的题，候选都必须**原样进载荷的 `options`**——那是模型真正
-          看到的候选清单，也是 `options_listed` 闸门的判据。模型看不到候选就会写出
+    预期：凡是声明了 `options` 的题，候选都必须**原样进提示内容的 `options`**——那是模型真正
+          看到的候选清单，也是 `options_listed` 校验的判据。模型看不到候选就会写出
           「下面是一些有趣的汉字。请问总笔画数最少的是哪一个？」（实测 16b 的 T11 一个候选
           都没列，读者根本没得选）。
     """
 
     def test_options_are_always_demanded_in_the_stem(self) -> None:
-        """四种选择题都必须把候选送进载荷（题干必须逐个原样列出）。"""
+        """四种选择题都必须把候选送进提示内容（题干必须逐个原样列出）。"""
         from hanzi_synth.facts.index import CharacterIndex
         from hanzi_synth.facts.loader import iter_characters
         from hanzi_synth.llm.verbalizer import _alias, _alias_map, payload_for
@@ -893,7 +893,7 @@ class ChoiceTaskRequirementTests(unittest.TestCase):
                     self.assertIn(
                         _alias(option, aliases),
                         payload["options"],
-                        f"{task_id} 的候选 {option!r} 没进载荷——模型会照抄"
+                        f"{task_id} 的候选 {option!r} 没进提示内容——模型会照抄"
                         "「下列选项」这种没有清单的句式，把候选整个漏掉（实测 16b 的 T11）",
                     )
         self.assertEqual(seen, set(builders), "样本里没凑齐这四种选择题")
@@ -901,14 +901,14 @@ class ChoiceTaskRequirementTests(unittest.TestCase):
 
 
 class StemAsksGateCoverageTests(unittest.TestCase):
-    """题干闸门的不变式：每个题型都必须声明 `stem_asks_any`，否则 `stem_asks` 整条跳过。
+    """题干校验的不变式：每个题型都必须声明 `stem_asks_any`，否则 `stem_asks` 整条跳过。
 
-    实测第十轮真机的 T1 U0340A 就是「题干问读音、答案是笔画数」的废题：闸门空着 = 不设防。
+    实测第十轮真机的 T1 U0340A 就是「题干问读音、答案是笔画数」的废题：校验空着 = 不设防。
     """
 
     def test_every_task_declares_a_stem_gate(self) -> None:
         """输入：覆盖全部 16 个题型的假字池。输出：无。
-        预期：池子真能出满 16 个题型（覆盖不全这条测试就没意义），且每条产出的
+        预期：字库真能出满 16 个题型（覆盖不全这条测试就没意义），且每条产出的
               `stem_asks_any` 都非空。
         """
         pool = full_coverage_pool()
@@ -923,10 +923,10 @@ class StemAsksGateCoverageTests(unittest.TestCase):
         self.assertEqual(seen, set(CONSTRUCTORS))
 
     def test_task_table_matches_what_constructors_declare(self) -> None:
-        """`registry.TASK_STEM_ASKS` 与构造器**实际**挂上的闸门不许漂移。
+        """`registry.TASK_STEM_ASKS` 与构造器**实际**挂上的校验不许漂移。
 
-        预期：这张表是复验（`spec_from_record`）补闸门用的唯一来源，一旦构造器改了闸门而表没跟，
-              复验就会拿旧闸门去查——「题干问错事」的废题会重新漏过去。
+        预期：这张表是复验（`spec_from_record`）补校验用的唯一来源，一旦构造器改了校验而表没跟，
+              复验就会拿旧校验去查——「题干问错事」的废题会重新漏过去。
         """
         pool = full_coverage_pool()
         index = make_index(pool)
@@ -942,18 +942,18 @@ class StemAsksGateCoverageTests(unittest.TestCase):
 
 
 class PayloadFactsCoverageTests(unittest.TestCase):
-    """措辞层载荷的裁剪不变式：每个题型都必须声明「这道题要发给模型的事实键」。
+    """措辞层提示内容的裁剪不变式：每个题型都必须声明「这道题要发给模型的事实键」。
 
-    构造器的 `facts` 是给闸门 / 离线渲染用的**全集**，措辞模型只需要其中写这道题要引用的
+    构造器的 `facts` 是给校验 / 离线渲染用的**全集**，措辞模型只需要其中写这道题要引用的
     那几个值。不声明时 `payload_for` 把整份 facts 发过去，模型就会拿别的题的材料当素材——
     实测 T16 的 `codepoint_forms` 里混着 UTF-8 字节序列，产出写成「给出码位 E3 90 8B，
     让读者从下列选项中选出对应的字」；T1 问笔画却带着 `radical` 与 `ids`。
-    声明写错（键名打错、抄了别型的键）会让载荷缺料、产出被闸门拒收，所以键必须在 facts 里。
+    声明写错（键名打错、抄了别型的键）会让提示内容缺料、产出被校验没通过，所以键必须在 facts 里。
     """
 
     def test_every_task_declares_payload_facts_present_in_facts(self) -> None:
         """输入：覆盖全部题型的假字池。输出：无。
-        预期：池子出满全部注册题型；每条的 `payload_facts` 非空，且每个键都在 `spec.facts` 里。
+        预期：字库出满全部注册题型；每条的 `payload_facts` 非空，且每个键都在 `spec.facts` 里。
         """
         pool = full_coverage_pool()
         index = make_index(pool)
@@ -965,12 +965,12 @@ class PayloadFactsCoverageTests(unittest.TestCase):
                 seen.add(spec.task_id)
                 self.assertTrue(spec.payload_facts, f"{spec.task_id} 没声明 payload_facts")
                 missing = [key for key in spec.payload_facts if key not in spec.facts]
-                self.assertEqual(missing, [], f"{spec.task_id} 声明的载荷键不在 facts 里：{missing}")
+                self.assertEqual(missing, [], f"{spec.task_id} 声明的提示内容键不在 facts 里：{missing}")
         self.assertEqual(seen, set(CONSTRUCTORS))
 
     def test_payload_sends_only_declared_keys(self) -> None:
         """输入：一条带多余 facts 的 spec。输出：无。
-        预期：载荷 facts 的键 = 声明的键；多余的一个都不发。
+        预期：提示内容 facts 的键 = 声明的键；多余的一个都不发。
         """
         from hanzi_synth.llm.verbalizer import payload_for
         from hanzi_synth.tasks.base import TaskSpec
@@ -987,7 +987,7 @@ class PayloadFactsCoverageTests(unittest.TestCase):
     def test_meaning_gloss_payload_hides_the_source_dictionary(self) -> None:
         """输入：假字池里的一条 T17 spec。输出：无。
 
-        预期：出处仍留在 `facts.source` 里供溯源，但**不进提示词载荷**——书名一进载荷，2B 就把它
+        预期：出处仍留在 `facts.source` 里供溯源，但**不进提示词内容**——书名一进提示内容，小模型就把它
         写进产出（实测 1,174/3,401 条带「根据康熙字典 / 根据《中华字海》的释义 / 出自《中华字海》」）。
         """
         from hanzi_synth.llm.verbalizer import payload_for

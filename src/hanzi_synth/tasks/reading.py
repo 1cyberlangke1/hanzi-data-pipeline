@@ -1,8 +1,8 @@
 """读音类题目构造器：T4 从释义标注里抽读音。
 
-读音在本库**不是独立字段**（叶码一族按 findings.md §9.6 已弃用），
+读音在本库**不是独立字段**（叶码一族已弃用），
 唯一来源是释义文本里的「拼音xxx1」标注 —— 用**确定性正则**抽取，不是模型猜测。
-抽取不到读音的字直接不出读音题（README 铁律 7：不能验证的宁可不做）。
+抽取不到读音的字直接不出读音题：不能验证的宁可不做。
 """
 
 from __future__ import annotations
@@ -80,8 +80,8 @@ def _reading_distractors(answer: str, rng: random.Random, depth: str) -> tuple[D
     return tuple(Distractor(text=v, why_wrong=f"该字读 {answer}，不是 {v}") for v in picked)
 
 
-# T4 的题干闸门：答案是读音，题干至少要命中一个「问读音」的说法。
-# 代价：549 条已发布产出里 **0 条**被它拒收。
+# T4 的题干校验：答案是读音，题干至少要命中一个「问读音」的说法。
+# 代价：549 条已发布产出里 **0 条**被它没通过。
 _READING_ASK_MARKERS = ("读音", "读作", "怎么读", "念作", "读法", "拼音", "发音")
 
 
@@ -118,7 +118,7 @@ def build_reading(
             f"「{character.zi}」的读音"
         ),
         facts={"zi": character.zi, "reading": canonical, "reading_display": shown, "radical": character.radical},
-        # 题干闸门：答案是**读音**，题干必须问读音（同 T1 的理由——闸门空着等于不设防）
+        # 题干校验：答案是**读音**，题干必须问读音（同 T1 的理由——校验空着等于不设防）
         stem_asks_any=_READING_ASK_MARKERS,
         answer=answer,
         answer_aliases=aliases,

@@ -6,7 +6,7 @@
 - `estimate_irt_from_responses` 才是真正的标定：没有作答数据时如实返回 `calibrated: False`，
   绝不编一组参数出来。
 
-本模块不做网络 IO；标定结果写旁路 JSON，不改产出。
+本模块不做网络 IO；标定结果写附带 JSON，不改产出。
 """
 
 from __future__ import annotations

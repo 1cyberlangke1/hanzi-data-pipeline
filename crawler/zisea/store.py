@@ -1,4 +1,4 @@
-"""JSONL 落盘与断点续爬支持。
+"""JSONL 写入文件与断点续爬支持。
 
 设计：单文件 JSONL（一行一条记录），天然可流式追加。
 「已完成集合」直接从 JSONL 回读，不另存状态文件，避免两份状态漂移。
@@ -43,7 +43,7 @@ class JsonlStore:
                     raise ValueError(f"{self.path}:{line_no} 不是合法 JSON: {exc}") from exc
 
     def load_keys(self) -> set[str]:
-        """输入：无。输出：已落盘记录的主键集合（用于断点续爬时跳过）。"""
+        """输入：无。输出：已写入文件记录的主键集合（用于断点续爬时跳过）。"""
         keys: set[str] = set()
         for record in self.iter_records():
             value = record.get(self.key_field)
@@ -61,7 +61,7 @@ class JsonlStore:
     # ---------- 写 ----------
 
     def append(self, record: dict) -> None:
-        """输入：一条记录。输出：无。预期：追加为一行并立即落盘（ensure_ascii=False 保中文可读）。"""
+        """输入：一条记录。输出：无。预期：追加为一行并立即写入文件（ensure_ascii=False 保中文可读）。"""
         with self.path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()

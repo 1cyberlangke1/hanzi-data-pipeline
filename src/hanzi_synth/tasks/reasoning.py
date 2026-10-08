@@ -139,19 +139,19 @@ def _leaf_total(character: Character) -> int:
         return -1
 
 
-# **题干闸门**（判据在 L4 的 `stem_asks`）：闸门空着 = 不设防，实测第十轮真机因此放出了
+# **题干校验**（判据在 L4 的 `stem_asks`）：校验空着 = 不设防，实测第十轮真机因此放出了
 # 「题干问读音、答案是笔画数」的废题。以下四条按「答案是什么」列同义说法。
 # 代价（549 条已发布产出逐条量）：T8 要补「一个字 / 一个汉字」（实测有产出写「请写出一个汉字，
-# 其部首是「宀」」）、T10 要补「选出 / 有别」、T12 要补「哪个」；补完只有 1 条 T10 被拒收——
+# 其部首是「宀」」）、T10 要补「选出 / 有别」、T12 要补「哪个」；补完只有 1 条 T10 被没通过——
 # 那条的题干写「请判断下列四个汉字「緻」「㐀」「𲷳」「𫄩」的部首关系。」，压根没说要从四个里挑出
 # 哪一个（读者不知道该答什么），是**真废题**。
 _CONSTRAINT_ASK_MARKERS = ("什么字", "哪个字", "哪一个字", "哪一个", "一个汉字", "一个字", "满足", "符合", "是什么")
 _ODD_ASK_MARKERS = ("哪一个", "哪个", "不同", "不一样", "异类", "有别", "选出")
 _EXTREME_ASK_MARKERS = ("笔画", "画数", "几画", "几笔", "多少画", "多少笔")
 _TRANSFORM_ASK_MARKERS = ("哪个字", "什么字", "哪个", "哪一个", "得到", "结果", "是什么")
-# T9 的闸门（答案是一个**部件**）：原先内联在构造器里，提出来是因为
+# T9 的校验（答案是一个**部件**）：原先内联在构造器里，提出来是因为
 # `registry.TASK_STEM_ASKS` 要按题型拿到它——旧产出记录的 `stem_asks_any` 是空的，
-# 复验时得用**当前**题型声明的闸门补上（见 `pipeline.run.spec_from_record`）。
+# 复验时得用**当前**题型声明的校验补上（见 `pipeline.run.spec_from_record`）。
 _CHAIN_ASK_MARKERS = ("部件", "哪个字", "什么字", "哪一个字", "何字")
 
 
@@ -274,7 +274,7 @@ def build_component_chain(
     # 泄露判据必须按**子串**比，不能按相等比：题干为了写出路径，必然原样带上每个位置词
     # （「右边」「中」这类），而答案可能是位置词的子串。实测有 (路径含「右边」, 答案「右」)
     # 与 (路径含「中」, 答案「中华字海」) 两种组合——无论模型怎么写，题干都会同时带上
-    # 路径词与答案，被判泄露后反复回炉，永远出不来。
+    # 路径词与答案，被判泄露后反复重跑，永远出不来。
     tokens = [*named, *path, final.label]
     if not final.component or any(
         final.component in token or token in final.component for token in tokens if token
@@ -286,7 +286,7 @@ def build_component_chain(
         task_id="T9_component_chain",
         payload_facts=("start_zi", "path"),
         instruction=(
-            # 位置链是题干**必须出现**的串（`must_contain`）：只写「沿位置链」2B 就不写具体
+            # 位置链是题干**必须出现**的串（`must_contain`）：只写「沿位置链」小模型就不写具体
             # 位置词，读者无从判断走哪一层，这道题不可作答（实测 0/2 → 2/2，probe_weave.jsonl）。
             f"从「{character.zi}」出发，沿 {'、'.join(path)} 这条位置链走到最里层的那个部件"
         ),
@@ -295,7 +295,7 @@ def build_component_chain(
         visible_subject=character.zi,
         # 路径描述是**必须出现的串**，不只是写作要求：实测 16r 的 T9 题干写「起始汉字为㐑，
         # 按照描述逐层拆解，最内层的部件是哪个字？」——描述一个都没写，读者无从判断走哪一层，
-        # 这道题不可作答。少了任何一个位置词都会被 `subject_visible` 拦下并回炉。
+        # 这道题不可作答。少了任何一个位置词都会被 `subject_visible` 拦下并重跑。
         must_contain=tuple(path),
         # 问的必须是答案那件事：答案是一个**部件**，问「这个字的结构是什么」读者必然答错
         # （实测 16p 的 T9 就是这么写的）
@@ -349,19 +349,19 @@ def build_odd_one_out(
         task_id="T10_odd_one_out",
         payload_facts=("other_options_radical",),
         instruction=(
-            # 候选**写进说明**：闸门要求题干逐个列出候选（读者要有得选），而只写「候选里」
-            # 2B 一个都不列（实测 0/2 → 2/2，probe_weave.jsonl）。生僻字由 `payload_for`
+            # 候选**写进说明**：校验要求题干逐个列出候选（读者要有得选），而只写「候选里」
+            # 小模型一个都不列（实测 0/2 → 2/2，probe_weave.jsonl）。生僻字由 `payload_for`
             # 统一换成占位符，模型不必自己敲。
             f"{'、'.join(options)} 里部首与其它几个不同的那个字"
         ),
         # 键名必须自解释：`radical` 是**其它三个候选共有**的部首，答案字的部首与它不同。
-        # 旧键名 `radical` 有歧义，实测 2B 据此写出自相矛盾的解析
+        # 旧键名 `radical` 有歧义，实测小模型据此写出自相矛盾的解析
         # （「「㐀」的部首是「子」，而其他三个字的部首也都是「子」，因此答案是「㐀」」）。
         facts={"other_options_radical": radical, "options": options, "answer_zi": character.zi},
         answer=character.zi,
         options=tuple(options),
         # 「部首」是本题的**比较对象**：题干不写它，读者不知道该按什么挑（实测 16z 的产出
-        # 「请从下列选项中选出哪一个：㐀、…」）。写进 `must_contain` 才真的接上闸门。
+        # 「请从下列选项中选出哪一个：㐀、…」）。写进 `must_contain` 才真的接上校验。
         must_contain=("部首",),
         stem_asks_any=_ODD_ASK_MARKERS,
         distractors=tuple(
@@ -410,7 +410,7 @@ def build_stroke_extreme(
         task_id="T11_stroke_extreme",
         payload_facts=("strokes",),
         instruction=(
-            # 候选写进说明（同 T10 的理由）：只写「候选里」2B 就不列候选，题干没有可选项。
+            # 候选写进说明（同 T10 的理由）：只写「候选里」小模型就不列候选，题干没有可选项。
             f"{'、'.join(options)} 里总笔画数{comparator}的那个字"
         ),
         facts={
@@ -421,7 +421,7 @@ def build_stroke_extreme(
         },
         answer=character.zi,
         options=tuple(options),
-        # 「笔画」是本题的**比较对象**：与 T10 同因——不声明就接不上 `subject_visible` 闸门。
+        # 「笔画」是本题的**比较对象**：与 T10 同因——不声明就接不上 `subject_visible` 校验。
         must_contain=("笔画",),
         stem_asks_any=_EXTREME_ASK_MARKERS,
         distractors=tuple(
@@ -534,7 +534,7 @@ def build_ids_transform(
         },
         answer=answer,
         visible_subject=character.zi,
-        # 题干闸门：答案是一个字，题干必须问「得到的字是哪个」（同 T1 的理由——闸门空着等于不设防）
+        # 题干校验：答案是一个字，题干必须问「得到的字是哪个」（同 T1 的理由——校验空着等于不设防）
         stem_asks_any=_TRANSFORM_ASK_MARKERS,
         distractors=_pick(
             [

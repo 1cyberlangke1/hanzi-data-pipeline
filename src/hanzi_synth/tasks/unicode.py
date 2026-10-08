@@ -92,8 +92,8 @@ def _codepoint_distractors(
     )
 
 
-# **题干闸门**（判据在 L4 的 `stem_asks`）：闸门空着 = 不设防（同 T1 的理由）。
-# 代价（549 条已发布产出逐条量）：三条各 **0 条**被拒收。
+# **题干校验**（判据在 L4 的 `stem_asks`）：校验空着 = 不设防（同 T1 的理由）。
+# 代价（549 条已发布产出逐条量）：三条各 **0 条**被没通过。
 _CODEPOINT_ASK_MARKERS = ("码位", "码点", "Unicode", "编码")
 _BYTES_ASK_MARKERS = ("UTF-8", "UTF8", "编码", "字节")
 _REVERSE_ASK_MARKERS = ("码位", "码点", "对应", "哪一个", "哪个字", "什么字", "哪个")
@@ -230,7 +230,7 @@ def build_unicode_reverse(
         task_id="T16_unicode_reverse",
         payload_facts=("codepoint", "codepoint_forms"),
         instruction=(
-            # 候选写进说明（同 T10 的理由）：只写「候选里」2B 就不列候选，题干没有可选项。
+            # 候选写进说明（同 T10 的理由）：只写「候选里」小模型就不列候选，题干没有可选项。
             f"{'、'.join(options)} 里码点等于 {shown} 的那个字"
         ),
         facts={

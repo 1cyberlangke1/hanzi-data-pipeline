@@ -1,4 +1,4 @@
-"""robots.py 单元测试：闸门判定、保守策略、URL 拼接。全部离线。"""
+"""robots.py 单元测试：校验判定、保守策略、URL 拼接。全部离线。"""
 
 from __future__ import annotations
 

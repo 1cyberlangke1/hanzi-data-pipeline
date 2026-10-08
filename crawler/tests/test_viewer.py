@@ -354,7 +354,7 @@ class SpriteOriginFetchTests(unittest.TestCase):
             return exc.code, exc.read()
 
     def test_default_never_touches_origin(self) -> None:
-        """默认配置下本地缺图只回 404，一个源站请求都不发（不绕过 robots 闸门）。"""
+        """默认配置下本地缺图只回 404，一个源站请求都不发（不绕过 robots 校验）。"""
         status, body = self._get(self._bases["off"], "/api/sprite/Z43651")
         self.assertEqual(status, 404)
         self.assertIn("error", json.loads(body))

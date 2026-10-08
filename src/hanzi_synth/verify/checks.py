@@ -1,7 +1,7 @@
-"""L4 验证栈：机械闸门只判「产出有没有背叛定死的载荷」，写法由 LLM 那一层判。
+"""L4 验证栈：机械校验只判「产出有没有背叛定死的提示内容」，写法由 LLM 那一层判。
 
 设计分界：
-- 机械闸门（本模块）判的是**事实保真**与**数据形态**：答案串在不在解析里、题干有没有把答案
+- 机械校验（本模块）判的是**事实保真**与**数据形态**：答案串在不在解析里、题干有没有把答案
   直接送出去、候选列没列全、数字是不是凭空造的、有没有被截断、题干是不是中文自然语言、
   有没有照抄释义原文。它**不判写法**：不判句式、不判语气、不判长短、不判有没有套话——
   那些是开放集合，用枚举去追永远追不完。
@@ -9,8 +9,8 @@
   与 L4.5 裁判（可选开关）。这两条是 LLM，不是规则表。
 - 「像不像已有的」交给 L6 去重（n-gram 相似度，是个度量，永远收敛）。
 
-机械闸门的判据只有两类，都不是「模型该怎么写」的规定：
-1. **载荷里的定死串**：答案、候选、必现串、隐藏主语、结构词——产出必须原样带上该带的、
+机械校验的判据只有两类，都不是「模型该怎么写」的规定：
+1. **提示内容里的定死串**：答案、候选、必现串、隐藏主语、结构词——产出必须原样带上该带的、
    绝不能带上不该带的（子串 / 集合比对）；
 2. **产出自身的形态**：中文自然语言、数字来源可查、没有被截断、与释义原文没有长串照抄。
 """
@@ -55,14 +55,14 @@ _STRUCTURE_WORDS: tuple[str, ...] = tuple(sorted(set(IDC_LABELS.values())))
 
 # 产出必须**上下文无关**：读者手里只有这道题本身。两类词出现即说明模型在跟程序对话而不是跟读者
 # 说话，或者把出题过程写进了题目：
-#   1. 程序侧的说法——「题干」「载荷」「槽位」「校验器」，英文缩写 `IDS` / `payload` / `facts` /
-#      `instruction`，以及闸门反馈里的行话（「必现串」）；
+#   1. 程序侧的说法——「题干」「提示内容」「位置」「校验器」，英文缩写 `IDS` / `payload` / `facts` /
+#      `instruction`，以及校验反馈里的行话（「必现串」）；
 #   2. 指代出题过程、指代一份**题干里并不存在**的东西——「本题」「题目要求」「提供的汉字」
 #      「提供的资料」。
-# 实测 2B 会把 instruction 里的字段名（`stem_must_contain` / `facts.conditions`）意译成
+# 实测小模型会把 instruction 里的字段名（`stem_must_contain` / `facts.conditions`）意译成
 # 「题干描述的…」「请在提供的汉字中找出…」，也会把英文夹注抄进中文题干
 # （「请说明字符㐀的 IDS（ideographic description sequence）分解方式」）。
-# `提供的` 单列成一条前缀：实测 2B 的固定开场是「根据提供的资料 / 信息 / 材料 / 汉字…」——
+# `提供的` 单列成一条前缀：实测小模型的固定开场是「根据提供的资料 / 信息 / 材料 / 汉字…」——
 # 读者手上并没有任何「提供」的东西，这个说法本身就说明题干不自足，具体跟哪个名词无关。
 # 判据是**子串比对**，判的是「产出里有没有出现这些说法」这件事实，与 `stem_is_chinese` 同类；
 # 它不是措辞规则表——不规定该怎么写，只挡下这些**不该出现在读者视野里**的词。
@@ -71,7 +71,7 @@ _INTERNAL_TERMS: tuple[str, ...] = (
     "解析", "payload", "facts", "instruction", "IDS",
     # 指代「一份并不存在的资料 / 出题过程」的说法。读者手上只有这道题本身，写出「根据资料」
     # 就是把出题人视角的话漏给了读者；实测全量 710,655 条里有 27 条这样（26 条出自加规范之前的
-    # 旧提示词、1 条是当前提示词仍在漏），**全都在解析里**——机械闸门原先只认「提供的」这一类，
+    # 旧提示词、1 条是当前提示词仍在漏），**全都在解析里**——机械校验原先只认「提供的」这一类，
     # 于是「根据资料 / 根据给定 / 资料显示」整类漏网。这几条判据与 `stem_is_chinese` 同类：
     # 只判「产出里有没有出现这种说法」这件事实，不规定该怎么写。
     "根据资料", "根据给定", "根据上述", "据资料", "资料显示", "此题", "本题目",
@@ -79,7 +79,7 @@ _INTERNAL_TERMS: tuple[str, ...] = (
     # 本来就点了书名的题型（T6 问页码）不受影响——它的题干里带着同一个书名，命中的是**引用框架**
     # 而不是书名本身，而 T6 的骨架不写框架（实测离线 707,551 条零命中）。
     "出自《", "收录于《", "见于《",
-    # 引用框架的第二类漏网（实测 `llm_semantic.jsonl` 3,467 条里 900+ 条）：2B 把「出处」写进产出，
+    # 引用框架的第二类漏网（实测 `llm_semantic.jsonl` 3,467 条里 900+ 条）：小模型把「出处」写进产出，
     # 形态远不止 `出自《` 一种——「根据《中华字海》的释义」「据中华字海的记载」「康熙字典中记载」
     # 「在《集韵》里」「说文解字说」。判据仍是**引用框架 / 书名**，不是「该怎么写」：
     # 下面每一条都在离线 707,551 条上量过命中 0（`字海` / `中华` / `在《` 命中 32,256 / 32,256 / 15,707
@@ -91,19 +91,19 @@ _INTERNAL_TERMS: tuple[str, ...] = (
 
 #
 # 占位符记号：程序给生僻字发的代号（`[[1]]`），回填发生在措辞之后——回填表里没有的记号（模型
-# 自己造出来的）没有任何东西能把它换掉，会原样进数据集。实测把示范写进对话轮次时，2B 会照着
-# 示范的形状在句尾多补一句 `[[1]]、[[2]]`；改掉示范形状后仍要有一道闸门兜底。
+# 自己造出来的）没有任何东西能把它换掉，会原样进数据集。实测把示范写进对话轮次时，小模型会照着
+# 示范的形状在句尾多补一句 `[[1]]、[[2]]`；改掉示范形状后仍要有一道校验保底。
 _PLACEHOLDER_RE = re.compile(r"\[\[\d+\]\]")
 
-# 两条闸门的名字，**只进 rejects / attempt-stats**（给人看）。两条分开写：
+# 两条校验的名字，**只进 rejects / attempt-stats**（给人看）。两条分开写：
 # 失败原因要能一眼分开，否则「裁判说不好」和「读者答不出答案」会被混成一类。
 # 回灌给措辞模型的那份**不带这两个名字**（见 `pipeline/run.py::_roundtrip_feedback`）——
-# 闸门名对模型毫无用处，只是塞进上下文的行话。
+# 校验名对模型毫无用处，只是塞进上下文的行话。
 JUDGE_FEEDBACK_KEY = "裁判否决"
 ROUNDTRIP_FEEDBACK_KEY = "往返检验否决"
 
 # 裁判的五条判据：裁判 system prompt 与措辞提示词都从这里生成，避免两边各写一份而漂移。
-# 合成的是中文数据，判据也一律中文——英文判据要多一道翻译，2B 会译错（真机把 `reading`
+# 合成的是中文数据，判据也一律中文——英文判据要多一道翻译，小模型会译错（真机把 `reading`
 # 译成「阅读」），而且译错的词会直接进产出。
 JUDGE_CRITERIA: tuple[tuple[str, str], ...] = (
     ("self_sufficient", "自足：只读题干，读者就知道要答什么、问的是哪个字或哪样东西——"
@@ -131,7 +131,7 @@ def _is_cjk(char: str) -> bool:
 
 
 def _cjk_count(text: str) -> int:
-    """输入：任意文本。输出：其中汉字的个数。预期：供「题干是中文自然语言」与「解析不是光秃答案」两条闸门用。"""
+    """输入：任意文本。输出：其中汉字的个数。预期：供「题干是中文自然语言」与「解析不是光秃答案」两条校验用。"""
     return sum(1 for char in (text or "") if _is_cjk(char))
 
 
@@ -173,9 +173,9 @@ def _missing_in_stem(stem: str, needles: "Sequence[str]") -> list[str]:
 def answer_leak_limit(spec: TaskSpec, item: str) -> int:
     """输入：TaskSpec + 一个答案串（主答案或别名）。输出：它在题干里允许出现的次数（0 或 1）。
 
-    预期：**渲染层与闸门共用这一份判据**——`visible_subject` / `must_contain` / `options` 里的串
+    预期：**渲染层与校验共用这一份判据**——`visible_subject` / `must_contain` / `options` 里的串
           是读者本来就要在题干里看到的（要从候选里选、要看见问的是哪个字），答案在其中时允许出现
-          1 次，其余 0 次。两处算法一旦分叉，渲染就会交出注定被闸门拒掉的句子：实测全量有 38 条
+          1 次，其余 0 次。两处算法一旦分叉，渲染就会交出注定被校验拒掉的句子：实测全量有 38 条
           (题型, 字) 因此一条数据都出不来，其中 32 条只要换一条不撞答案的句式就能出
           （`synthesis/out/probe_leak_rescue.py`）。判据比的是**归一化后**的串（`normalize_for_match`
           会去掉空白与列举分隔符，T15 的「E3 90 8B」这类带空格的写法靠它才比得准）。
@@ -192,11 +192,11 @@ def answer_leak_limit(spec: TaskSpec, item: str) -> int:
 
 
 def leaked_field_names(spec: TaskSpec, text: str) -> list[str]:
-    """输入：TaskSpec + 一段正文。输出：正文里逐字出现的**载荷键名**（排序去重）。
+    """输入：TaskSpec + 一段正文。输出：正文里逐字出现的**提示内容键名**（排序去重）。
 
     预期：键名 = `payload_for(spec)` 的字段名 ∪ `spec.facts` 的键。只比**键**，不比**值**——
           值本来就该出现在正文里（答案、候选、读音、笔画数都是值）。
-          键名表是**从载荷本身推出来的**，不写死：新增题型字段自动被覆盖，不会变成一张追不完的
+          键名表是**从提示内容本身推出来的**，不写死：新增题型字段自动被覆盖，不会变成一张追不完的
           规则表。`payload_for` 反向依赖本模块，所以这里延迟导入。
     """
     from ..llm.verbalizer import payload_for  # 延迟导入：verbalizer 反过来要 import 本模块
@@ -208,7 +208,7 @@ def leaked_field_names(spec: TaskSpec, text: str) -> list[str]:
     return sorted({name for name in names if len(name) >= 3 and name.lower() in low})
 
 
-# 判据词被**连成一串**念出来多长才算「把判据词表罗列出来」。正常问句会命中一两个（那是闸门
+# 判据词被**连成一串**念出来多长才算「把判据词表罗列出来」。正常问句会命中一两个（那是校验
 # 本来就要求的），但不会连着念；把整张表搬进题干（「读作、怎么读、念作、读法、拼音」）才会连成串。
 # 只算中间**只隔分隔符 / 并列连词**的那些——按「命中总数」判会把正常措辞误杀（实测 T16 写
 # 「编码码点…请根据码位与码点的对应关系」，命中 5 个词但一个都不相邻，是正常问句）。
@@ -227,10 +227,10 @@ _FOREIGN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 
 
 def foreign_words(spec: TaskSpec, text: str) -> list[str]:
-    """输入：TaskSpec + 一段正文。输出：正文里出现的、**载荷里没有**的 ASCII 字母串。
+    """输入：TaskSpec + 一段正文。输出：正文里出现的、**提示内容里没有**的 ASCII 字母串。
 
     预期：中文散文里夹英文词就是没写中文（实测 T3 写「结构 notation 字符串」）。判据是子串 /
-          集合比对：字母串要么出现在载荷文本里（`UTF-8`、`xi3`、`E3 90 80` 这类本来就是数据），
+          集合比对：字母串要么出现在提示内容文本里（`UTF-8`、`xi3`、`E3 90 80` 这类本来就是数据），
           要么是 `_ALLOWED_FOREIGN_WORDS` 里的标准术语。大小写不敏感。
     """
     haystack = json.dumps(spec.facts, ensure_ascii=False, default=str)
@@ -248,7 +248,7 @@ def _numbers_in(text: str) -> set[str]:
 
 
 def allowed_numbers(spec: TaskSpec) -> set[str]:
-    """输入：TaskSpec。输出：载荷里出现过的全部阿拉伯数字串。
+    """输入：TaskSpec。输出：提示内容里出现过的全部阿拉伯数字串。
     预期：事实、答案（含别名与写法）与候选里的数字都算合法来源——产出里的数字只要能在
           这些地方找到就算忠实，找不到就是凭空造的。
     """
@@ -297,7 +297,7 @@ def _longest_marker_run(stem: str, markers: "Sequence[str]") -> tuple[int, list[
 
 @dataclass(frozen=True)
 class Verification:
-    """输入：各道机械闸门的结果。输出：不可变验证记录，直接写进产出。
+    """输入：各道机械校验的结果。输出：不可变验证记录，直接写进产出。
     预期：`tier == 'A'` 才允许进入 L4.5 / L4.6；发布与否由 `pipeline.run._publishable` 统一判。
     """
 
@@ -324,7 +324,7 @@ class Verification:
     explanation_is_prose: bool = False
     failures: tuple[str, ...] = ()
     # 同一批失败的**模型侧**说法，只回灌给措辞模型（`pipeline/run.py` 的 reflexion）。
-    # 中文，且刻意用 `_INTERNAL_TERMS` 里的词（题干 / 载荷 / 必现串）——模型把反馈原文抄进产出，
+    # 中文，且刻意用 `_INTERNAL_TERMS` 里的词（题干 / 提示内容 / 必现串）——模型把反馈原文抄进产出，
     # `no_internal_terms` 当场拦下。与 `failures` 同序同长。
     notes: tuple[str, ...] = ()
     # 答案核验的**语义那一半**的痕迹：`answer_in_explanation` 是子串比对，判得了「解析里有没有那串
@@ -335,7 +335,7 @@ class Verification:
 
     @property
     def tier(self) -> str:
-        """输入：无。输出：'A'（下面列的闸门全过）或 'C'（有任一未过）。
+        """输入：无。输出：'A'（下面列的校验全过）或 'C'（有任一未过）。
         预期：B 级留给「缺裁判」的场景，本层不产生。
         """
         return "A" if all(
@@ -365,7 +365,7 @@ class Verification:
         ) else "C"
 
     def as_dict(self) -> dict:
-        """输入：无。输出：可 JSON 序列化的字典。预期：留 tier 与 failures 供审计与回炉读。"""
+        """输入：无。输出：可 JSON 序列化的字典。预期：留 tier 与 failures 供审计与重跑读。"""
         return {
             "schema": self.schema,
             "no_empty_slot": self.no_empty_slot,
@@ -400,7 +400,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     预期：任一条不过就记进 failures，绝不因为「只差一点点」而放行。
           `failures` 给人看（rejects / attempt-stats），`notes` 回灌给措辞模型；两份在同一个
           地方同源生成，同序同长，不会漂移。两份**都是中文**：合成的是中文数据，中英混排会让
-          2B 多一道翻译并译错。`notes` 刻意用闸门会拦的词（题干 / 载荷 / 必现串）——模型把反馈
+          小模型多一道翻译并译错。`notes` 刻意用校验会拦的词（题干 / 提示内容 / 必现串）——模型把反馈
           抄进产出即被 `no_internal_terms` 拦下，抄不回数据集。
     """
     failures: list[str] = []
@@ -408,13 +408,13 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
 
     schema_ok = bool(verbalized.ok and verbalized.stem and isinstance(verbalized.explanation, str))
     if not schema_ok:
-        failures.append("schema: 槽位缺失或为空")
-        notes.append("回的不是一个带非空题干与解析的 JSON 对象。两个槽位都要填上。")
+        failures.append("schema: 位置缺失或为空")
+        notes.append("回的不是一个带非空题干与解析的 JSON 对象。两个位置都要填上。")
         return Verification(schema=False, failures=tuple(failures), notes=tuple(notes))
 
     stem, explanation = verbalized.stem, verbalized.explanation
 
-    # 1. 空槽位兜底：`_slot_check` 已挡一层，这里防别处构造的 Verbalized 漏进来。
+    # 1. 空位置保底：`_slot_check` 已挡一层，这里防别处构造的 Verbalized 漏进来。
     no_empty_slot = bool(stem.strip() and explanation.strip())
     if not no_empty_slot:
         failures.append("no_empty_slot: 题干或解析是空白")
@@ -469,7 +469,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
             "不许用「这个读音」「上边的部件」这类指代代替。"
         )
 
-    # 4b. 选择题：候选必须逐个出现在题干里。**这条不能省**——往返检验的载荷里带着 options，
+    # 4b. 选择题：候选必须逐个出现在题干里。**这条不能省**——往返检验的提示内容里带着 options，
     #     读者永远看得见候选，所以「题干没列候选」往返检验抓不到，只有这里能抓。
     options_listed = not _missing_in_stem(stem, spec.options)
     if not options_listed:
@@ -514,19 +514,19 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
                 f"解析里出现了答案用不到的结构词 {invented}。只能出现 {list(spec.structure_words)}。"
             )
 
-    # 5. 数字必须来自载荷：产出里出现载荷没有的阿拉伯数字 = 凭空造数（笔画数、码位最容易编）。
+    # 5. 数字必须来自提示内容：产出里出现提示内容没有的阿拉伯数字 = 凭空造数（笔画数、码位最容易编）。
     allowed = allowed_numbers(spec)
     invented = sorted((_numbers_in(stem) | _numbers_in(explanation)) - allowed)
     numbers_from_facts = not invented
     if invented:
-        failures.append(f"numbers_from_facts: 正文里出现了载荷中没有的数字 {invented}")
-        notes.append(f"正文里出现了载荷中没有的数字 {invented}。只能用载荷里给的那些。")
+        failures.append(f"numbers_from_facts: 正文里出现了提示内容中没有的数字 {invented}")
+        notes.append(f"正文里出现了提示内容中没有的数字 {invented}。只能用提示内容里给的那些。")
 
     # 6. 截断：`finish_reason == 'length'` 说明这次产出被按长度砍断，不是完整的一句话。
     not_truncated = verbalized.finish_reason != "length"
     if not not_truncated:
         failures.append("not_truncated: 产出被按长度截断")
-        notes.append("产出被截断了，没写完。两个槽位都写短一点，保证能写完。")
+        notes.append("产出被截断了，没写完。两个位置都写短一点，保证能写完。")
 
     # 7. 题干必须是**中文自然语言**：判据是「题干里一个汉字都没有」这件事实——整段用英文作答的
     #    产出必然一个汉字都没有，一抓一个准。（程序侧文本已改成中文，「照抄出题说明」不再由这条
@@ -546,7 +546,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
         failures.append(
             f"no_source_copy: 题干与释义原文连续相同超过 {_SOURCE_COPY_RUN - 1} 个汉字（照抄释义）"
         )
-        # 这是 21 个闸门里**唯一**漏了模型侧说法的一条：漏了它，`_run_one` 只能把带闸门名的
+        # 这是 21 个校验里**唯一**漏了模型侧说法的一条：漏了它，`_run_one` 只能把带校验名的
         # `failures` 原文回灌给模型（实测 T13 因此反复在同一处摔，129 条 rejects 全是这条）。
         notes.append(
             "题干把释义原文整段搬了过来，读起来像照抄字典。释义只是素材：意思要讲全，"
@@ -567,7 +567,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
             "用一句完整的话把它问出来。"
         )
 
-    # 9. 产出不得出现程序侧的说法：题干或解析里冒出「题干」「载荷」「槽位」「校验器」「IDS」
+    # 9. 产出不得出现程序侧的说法：题干或解析里冒出「题干」「提示内容」「位置」「校验器」「IDS」
     #    这类词，说明模型在跟程序对话而不是跟读者说话——产出必须上下文无关。
     #    实测 T9 写「题干描述的位置链为…」、T3 写「IDS（ideographic description sequence）」。
     blob_lower = f"{stem}\n{explanation}".lower()
@@ -575,28 +575,28 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
     no_internal_terms = not leaked_terms
     if leaked_terms:
         failures.append(f"no_internal_terms: 产出里出现了程序侧的说法 {leaked_terms}")
-        # **不把那些词抄进反馈**：把泄漏的词原样回灌，2B 会再抄一遍（实测第二轮照样写
+        # **不把那些词抄进反馈**：把泄漏的词原样回灌，小模型会再抄一遍（实测第二轮照样写
         # 「根据提供的信息」）。只说「删掉指代出题过程的说法、直接陈述事实」，不点名。
         notes.append(
             "正文里混进了出题说明的说法，不是写给读者看的话。把所有指代出题过程、字段、"
             "「提供的」清单的说法删掉，直接用一句平实的中文把事实说出来。"
         )
 
-    # 10. 载荷的**键名**不得出现在正文里：键名是程序侧的英文标识符（`stroke_total` / `codepoint` /
+    # 10. 提示内容的**键名**不得出现在正文里：键名是程序侧的英文标识符（`stroke_total` / `codepoint` /
     #     `stem_must_contain`），读者只该看到键对应的**值**。实测 T1 解析写「「㐀」的 stroke_total 为 5」、
     #     T4 解析写「这个字的标准拼音是 xi3」这类字段名漏进散文。判据是子串比对（键名全是 ASCII，
     #     中文自然语言里出现即泄漏），与 `stem_is_chinese` 同类。
     leaked_fields = leaked_field_names(spec, f"{stem}\n{explanation}")
     no_field_names = not leaked_fields
     if leaked_fields:
-        failures.append(f"no_field_names: 正文里出现了载荷键名 {leaked_fields}")
+        failures.append(f"no_field_names: 正文里出现了提示内容键名 {leaked_fields}")
         notes.append(
-            f"正文里出现了载荷的键名 {leaked_fields}。要写的是键对应的值，不是键名本身。"
+            f"正文里出现了提示内容的键名 {leaked_fields}。要写的是键对应的值，不是键名本身。"
         )
 
     # 10b. 题干不许把 `stem_asks_any` 里的说法**连成一串**念出来：那张表是程序侧的判据词表，
     #      不是可以念给读者听的清单。实测 T4 写「读作、怎么读、念作、读法、拼音、发音这些要求
-    #      里都包含读音」——把整张表搬进了题干。正常问句命中一两个词不算（那是闸门本来就要求的），
+    #      里都包含读音」——把整张表搬进了题干。正常问句命中一两个词不算（那是校验本来就要求的），
     #      连成一串才算；只隔分隔符 / 并列连词的才计入（见 `_longest_marker_run`）。
     marker_run, marker_words = _longest_marker_run(stem, spec.stem_asks_any)
     no_marker_enumeration = marker_run < _MARKER_ENUMERATION_RUN
@@ -606,17 +606,17 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
             "题干把好几种问同一件事的说法连在一起念了出来。用自己的话说一次，那张清单不要念。"
         )
 
-    # 11. 正文必须是中文散文：夹进来的英文词要么是载荷里的数据（`UTF-8` / `xi3` / `E3 90 80`），
+    # 11. 正文必须是中文散文：夹进来的英文词要么是提示内容里的数据（`UTF-8` / `xi3` / `E3 90 80`），
     #     要么是标准术语白名单里的词；其余都是「没写中文」（实测 T3 写「结构 notation 字符串」）。
     stray_words = foreign_words(spec, f"{stem}\n{explanation}")
     no_foreign_words = not stray_words
     if stray_words:
-        failures.append(f"no_foreign_words: 正文里出现了载荷中没有的英文词 {stray_words}")
+        failures.append(f"no_foreign_words: 正文里出现了提示内容中没有的英文词 {stray_words}")
         notes.append(
-            f"正文里出现了载荷里没有的英文词 {stray_words}。这些部分用中文写，只保留载荷给的那些值。"
+            f"正文里出现了提示内容里没有的英文词 {stray_words}。这些部分用中文写，只保留提示内容给的那些值。"
         )
 
-    # 12. 正文里不得有转义残留：实测 2B 会吐出字面的 `\n`（JSON 里写成 `\\n`），
+    # 12. 正文里不得有转义残留：实测小模型会吐出字面的 `\n`（JSON 里写成 `\\n`），
     #     发布出去读者看到的是「…的字。\n选项包括：…」。散文里本来就不该有反斜杠，
     #     所以判据是「有没有反斜杠」这件事实，与 `stem_is_chinese` 同类。
     no_escape_artifacts = "\\" not in stem and "\\" not in explanation
@@ -639,7 +639,7 @@ def verify(spec: TaskSpec, verbalized: "Verbalized") -> Verification:
 
     # 14. 解析不能只是**光秃答案**：`answer_in_explanation` 只查「答案串在不在解析里」，光秃
     #     答案天然在——真机实测 T9 回一个「七」就发布了（T3 回「⿱卝一」同理）。数据要的是**自然
-    #     语言**，所以解析里除了答案本身，还得有中文说明。判据与其它闸门同类（子串比对），不规定
+    #     语言**，所以解析里除了答案本身，还得有中文说明。判据与其它校验同类（子串比对），不规定
     #     该怎么措辞。全量离线数据 739,005 条复查：**0 条**会因此被判 C（`scan_bare_answer.py`）。
     stripped_explanation = explanation_norm
     for item in (spec.answer, *spec.accepted):

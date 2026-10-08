@@ -1,12 +1,12 @@
 """多 provider 的 OpenAI 兼容 Chat 客户端。
 
-设计要点（findings.md §9.2 / 主人指令）：
+设计要点：
 - **不设 `max_tokens`**：思考段会吃光额度；不设时模型自己以 finish_reason=stop 收尾；
 - 限额来自配置（`ProviderConfig.rpm`），由 SlidingWindowLimiter 在客户端侧挡住，
   所以正常情况不会打到网关的 429；
 - 429 / 5xx 做**有界退避重试**，仍失败则**故障转移到下一个 provider**；
 - **引擎侧临时故障伪装成的 4xx 也重试**：本地推理服务在并发下会把「KV 缓存挤爆」这类
-  引擎内部错误报成 HTTP 400（实测 LM Studio：「Context size has been exceeded」，
+  引擎内部错误报成 HTTP 400（实测本地推理引擎：「Context size has been exceeded」，
   而同一份 payload 单独重发立刻成功），所以按报文特征识别，不能只看状态码；
 - 报错说人话，且**永不回显 api_key**。
 """
@@ -25,7 +25,7 @@ from .ratelimit import SlidingWindowLimiter
 from .thinking import strip_thinking
 
 # 报成 4xx 但其实是**引擎侧临时故障**的报文特征（小写比对）。
-# 判据来自实测：LM Studio 在 4 路并发下偶发 `HTTP 400 ... Context size has been exceeded`，
+# 判据来自实测：本地推理引擎在 4 路并发下偶发 `HTTP 400 ... Context size has been exceeded`，
 # 而提示词只有 3000 字符、`loaded_context_length` 是 32000——不可能是真的超长；
 # 同一份 payload 单独重发一次就成功，说明它是引擎侧的瞬态状态，重发有意义。
 _TRANSIENT_4XX_MARKERS = ("context size has been exceeded",)
@@ -114,7 +114,7 @@ class ChatClient:
                 if response.status_code >= 400:
                     last_error = f"{provider.name}: HTTP {response.status_code} {self._safe_message(response)}"
                     if is_transient_4xx(response):
-                        # 引擎侧瞬态：退避重发同一份请求（实测重发即成功），别把它当成拒收理由
+                        # 引擎侧瞬态：退避重发同一份请求（实测重发即成功），别把它当成没通过理由
                         time.sleep(self._backoff * (attempt + 1))
                         continue
                     break  # 4xx 是请求本身的问题，换 provider 也没用，但仍尝试下一个
